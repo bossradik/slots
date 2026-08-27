@@ -1,741 +1,170 @@
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Royal Slots 777</title>
+import asyncio
+import secrets
+import time
+from pathlib import Path
 
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column
 
-<style>
-* {
-    box-sizing: border-box;
-    -webkit-tap-highlight-color: transparent;
-    user-select: none;
+
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"  # Вставьте сюда ваш токен от @BotFather
+DEFAULT_BET = 50               # Ставка по умолчанию
+SPAM_TIMEOUT = 3               # Секунды между вращениями
+DB_PATH = Path("slotbot.db")   # Файл базы данных
+
+
+# --- БАЗА ДАННЫХ (SQLite + SQLAlchemy) ---
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    user_id: Mapped[int] = mapped_column(primary_key=True)
+    balance: Mapped[int] = mapped_column(default=1000) # Стартовый баланс
+    last_spin_ts: Mapped[float] = mapped_column(default=0.0)
+
+engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False, future=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+# --- ЛОГИКА ИГРЫ ---
+SYMBOLS = ["🍒", "🍋", "🔔", "💎", "7️⃣"]
+WIN_TABLE = {
+    "🍒": 5,
+    "🍋": 10,
+    "🔔": 20,
+    "💎": 50,
+    "7️⃣": 100
 }
 
-body {
-    margin: 0;
-    padding: 10px 6px;
-    background: #0b0711;
-    background-image: radial-gradient(circle at 50% 20%, #2a0845 0%, #0b0711 80%);
-    color: #ffffff;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
-}
+def check_win(reels: list[str]) -> tuple[bool, int]:
+    """Проверяет линию. Возвращает (выигрыш: да/нет, множитель)."""
+    if reels.count(reels[0]) == 3:
+        return True, WIN_TABLE.get(reels[0], 0)
+    if reels.count(reels[0]) == 2 or reels.count(reels[1]) == 2:
+        return True, 1
+    return False, 0
 
-.casino-app {
-    width: 100%;
-    max-width: 440px;
-    margin: 0 auto;
-    background: rgba(22, 13, 35, 0.95);
-    border: 2px solid #ffd700;
-    border-radius: 28px;
-    padding: 18px 14px 28px;
-    box-shadow: 0 0 35px rgba(255, 215, 0, 0.25), inset 0 0 15px rgba(255, 215, 0, 0.1);
-    position: relative;
-}
 
-.header {
-    text-align: center;
-    margin-bottom: 15px;
-}
-
-.logo {
-    font-size: 26px;
-    font-weight: 900;
-    background: linear-gradient(180deg, #fff6a5 0%, #ffd700 40%, #caa100 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    text-shadow: 0 2px 10px rgba(255, 215, 0, 0.4);
-    letter-spacing: 1px;
-    margin: 0;
-    text-transform: uppercase;
-}
-
-.sub-title {
-    font-size: 11px;
-    color: #bfa8dd;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    margin-top: 3px;
-}
-
-/* Stats Header Bar */
-.stats-bar {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    margin-bottom: 16px;
-}
-
-.stat-card {
-    flex: 1;
-    background: linear-gradient(145deg, rgba(40, 20, 65, 0.9), rgba(20, 8, 35, 0.9));
-    border: 1px solid rgba(255, 215, 0, 0.3);
-    border-radius: 14px;
-    padding: 8px 10px;
-    text-align: center;
-}
-
-.stat-label {
-    font-size: 11px;
-    color: #9d85c0;
-    margin-bottom: 2px;
-}
-
-.stat-value {
-    font-size: 18px;
-    font-weight: 800;
-    color: #ffd700;
-}
-
-/* Slot Machine Frame */
-.slot-machine {
-    background: linear-gradient(180deg, #400a2b 0%, #1a0413 100%);
-    border: 4px solid #f39c12;
-    border-radius: 20px;
-    padding: 12px 10px;
-    box-shadow: 0 8px 25px rgba(0,0,0,0.8), inset 0 0 20px rgba(255, 152, 0, 0.3);
-    position: relative;
-    margin-bottom: 16px;
-}
-
-.slot-machine::before {
-    content: "в… JACKPOT в…";
-    position: absolute;
-    top: -12px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: #e74c3c;
-    color: #fff;
-    font-size: 11px;
-    font-weight: 900;
-    padding: 2px 14px;
-    border-radius: 10px;
-    border: 1px solid #ffd700;
-    letter-spacing: 1px;
-    box-shadow: 0 0 10px #e74c3c;
-}
-
-.reels-container {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    background: #000;
-    padding: 8px;
-    border-radius: 14px;
-    border: 2px solid #5a1238;
-    position: relative;
-    overflow: hidden;
-}
-
-/* Payline overlay */
-.payline {
-    position: absolute;
-    top: 50%;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background: rgba(255, 215, 0, 0.6);
-    box-shadow: 0 0 8px #ffd700;
-    z-index: 5;
-    pointer-events: none;
-}
-
-.reel {
-    flex: 1;
-    height: 110px;
-    background: linear-gradient(180deg, #111 0%, #222 50%, #111 100%);
-    border-radius: 10px;
-    border: 1px solid #333;
-    overflow: hidden;
-    position: relative;
-}
-
-.reel-strip {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    transition: transform 0.1s linear;
-}
-
-.symbol {
-    height: 110px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 54px;
-    filter: drop-shadow(0 2px 5px rgba(0,0,0,0.7));
-}
-
-/* Win Display Message */
-.win-banner {
-    min-height: 40px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    font-size: 16px;
-    font-weight: 800;
-    color: #2ecc71;
-    text-shadow: 0 0 8px rgba(46, 204, 113, 0.6);
-    margin-bottom: 14px;
-    background: rgba(0,0,0,0.3);
-    border-radius: 12px;
-    padding: 6px 10px;
-}
-
-/* Bet Selector */
-.controls-section {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-
-.bet-control {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: rgba(0,0,0,0.4);
-    border-radius: 14px;
-    padding: 6px 8px;
-    border: 1px solid rgba(255,255,255,0.08);
-}
-
-.bet-label {
-    font-size: 13px;
-    color: #a38ec2;
-    padding-left: 6px;
-}
-
-.bet-buttons {
-    display: flex;
-    gap: 6px;
-}
-
-.bet-btn {
-    background: #25103a;
-    border: 1px solid #6b3ba7;
-    color: #d1c1eb;
-    padding: 8px 12px;
-    border-radius: 10px;
-    font-size: 13px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: all 0.15s;
-}
-
-.bet-btn.active {
-    background: linear-gradient(180deg, #f39c12 0%, #d35400 100%);
-    border-color: #ffd700;
-    color: #fff;
-    box-shadow: 0 0 10px rgba(243, 156, 18, 0.5);
-}
-
-/* Main Action Buttons */
-.action-buttons {
-    display: flex;
-    gap: 10px;
-}
-
-.spin-btn {
-    flex: 2;
-    height: 60px;
-    background: linear-gradient(180deg, #2ecc71 0%, #27ae60 100%);
-    border: 2px solid #a3e4d7;
-    border-radius: 16px;
-    color: #fff;
-    font-size: 20px;
-    font-weight: 900;
-    cursor: pointer;
-    box-shadow: 0 6px 0 #1e8449, 0 10px 20px rgba(46, 204, 113, 0.4);
-    transition: all 0.1s;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-.spin-btn:active:not(:disabled) {
-    transform: translateY(4px);
-    box-shadow: 0 2px 0 #1e8449, 0 4px 10px rgba(46, 204, 113, 0.4);
-}
-
-.spin-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-    filter: grayscale(0.5);
-}
-
-.auto-btn {
-    flex: 1;
-    height: 60px;
-    background: linear-gradient(180deg, #3498db 0%, #2980b9 100%);
-    border: 2px solid #a9cce3;
-    border-radius: 16px;
-    color: #fff;
-    font-size: 13px;
-    font-weight: 800;
-    cursor: pointer;
-    box-shadow: 0 6px 0 #1b4f72, 0 10px 20px rgba(52, 152, 219, 0.3);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.1s;
-}
-
-.auto-btn.active {
-    background: linear-gradient(180deg, #e74c3c 0%, #c0392b 100%);
-    border-color: #fadbd8;
-    box-shadow: 0 6px 0 #78281f, 0 10px 20px rgba(231, 76, 60, 0.4);
-}
-
-/* Secondary Buttons: Gift & Paytable */
-.secondary-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 10px;
-}
-
-.sec-btn {
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.12);
-    color: #dcd0ef;
-    padding: 10px;
-    border-radius: 12px;
-    font-size: 13px;
-    font-weight: 700;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-}
-
-/* Paytable Modal */
-.modal {
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0,0,0,0.85);
-    z-index: 100;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    padding: 16px;
-}
-
-.modal.active {
-    display: flex;
-}
-
-.modal-content {
-    background: #1a0b2e;
-    border: 2px solid #ffd700;
-    border-radius: 20px;
-    padding: 20px;
-    max-width: 380px;
-    width: 100%;
-    max-height: 85vh;
-    overflow-y: auto;
-}
-
-.modal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 14px;
-}
-
-.modal-title {
-    font-size: 18px;
-    font-weight: 800;
-    color: #ffd700;
-}
-
-.close-btn {
-    background: none;
-    border: none;
-    color: #fff;
-    font-size: 22px;
-    cursor: pointer;
-}
-
-.pay-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.1);
-    font-size: 14px;
-}
-
-.pay-sym { font-size: 24px; }
-.pay-val { font-weight: bold; color: #2ecc71; }
-</style>
-</head>
-<body>
-
-<div class="casino-app">
-    <!-- Header -->
-    <div class="header">
-        <h1 class="logo">рџ‘‘ ROYAL SLOTS 777</h1>
-        <div class="sub-title" id="txt_subtitle"></div>
-    </div>
-
-    <!-- Stats Bar -->
-    <div class="stats-bar">
-        <div class="stat-card">
-            <div class="stat-label" id="txt_bal_label"></div>
-            <div class="stat-value"><span id="balance">1000</span> рџЄ™</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label" id="txt_lvl_label"></div>
-            <div class="stat-value"><span id="level">1</span> в­ђ</div>
-        </div>
-    </div>
-
-    <!-- Slot Machine -->
-    <div class="slot-machine">
-        <div class="reels-container">
-            <div class="payline"></div>
-            <div class="reel" id="reel0"><div class="reel-strip" id="strip0"></div></div>
-            <div class="reel" id="reel1"><div class="reel-strip" id="strip1"></div></div>
-            <div class="reel" id="reel2"><div class="reel-strip" id="strip2"></div></div>
-        </div>
-    </div>
-
-    <!-- Win Status Banner -->
-    <div class="win-banner" id="winBanner">
-        <span id="txt_welcome"></span>
-    </div>
-
-    <!-- Controls Section -->
-    <div class="controls-section">
-        <div class="bet-control">
-            <span class="bet-label" id="txt_bet_label"></span>
-            <div class="bet-buttons">
-                <button class="bet-btn active" onclick="setBet(10)">10</button>
-                <button class="bet-btn" onclick="setBet(50)">50</button>
-                <button class="bet-btn" onclick="setBet(100)">100</button>
-                <button class="bet-btn" onclick="setBet(500)">500</button>
-            </div>
-        </div>
-
-        <div class="action-buttons">
-            <button class="spin-btn" id="spinBtn" onclick="userSpin()"></button>
-            <button class="auto-btn" id="autoBtn" onclick="toggleAutoSpin()">
-                <span id="txt_auto_label"></span>
-            </button>
-        </div>
-
-        <div class="secondary-actions">
-            <button class="sec-btn" onclick="claimDailyBonus()">
-                рџЋЃ <span id="txt_gift_label"></span>
-            </button>
-            <button class="sec-btn" onclick="openPaytable()">
-                в„№пёЏ <span id="txt_info_label"></span>
-            </button>
-        </div>
-    </div>
-</div>
-
-<!-- Paytable Modal -->
-<div class="modal" id="paytableModal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <div class="modal-title" id="txt_modal_title"></div>
-            <button class="close-btn" onclick="closePaytable()">вњ•</button>
-        </div>
-        <div id="paytableList"></div>
-    </div>
-</div>
-
-<script>
-/* Safe String Decoder to prevent clipboard encoding problems */
-function T(s) {
-    try {
-        return decodeURIComponent(s);
-    } catch(e) {
-        return s;
-    }
-}
-
-// Symbols configuration
-const SYMBOLS = ['7пёЏвѓЈ', 'рџ‘‘', 'рџ’Ћ', 'рџ””', 'рџЌ‡', 'рџЌ‹', 'рџЌ’'];
-const MULTIPLIERS = {
-    '7пёЏвѓЈ': 100, // Jackpot
-    'рџ‘‘': 50,
-    'рџ’Ћ': 25,
-    'рџ””': 15,
-    'рџЌ‡': 10,
-    'рџЌ‹': 5,
-    'рџЌ’': 3
-};
-
-// Game state
-let state = {
-    balance: 1000,
-    level: 1,
-    xp: 0,
-    currentBet: 10,
-    lastSpinTime: 0,
-    lastGiftTime: 0
-};
-
-let isSpinning = false;
-let isAutoSpin = false;
-let currentReelIndices = [0, 0, 0];
-
-// Telegram WebApp initialization
-const tg = window.Telegram?.WebApp;
-if (tg) {
-    tg.ready();
-    tg.expand();
-    try {
-        tg.setHeaderColor("#0b0711");
-        tg.setBackgroundColor("#0b0711");
-    } catch(e) {}
-}
-
-function triggerHaptic(type = 'medium') {
-    if (tg?.HapticFeedback) {
-        try {
-            if (type === 'success') tg.HapticFeedback.notificationOccurred('success');
-            else tg.HapticFeedback.impactOccurred('medium');
-        } catch(e) {}
-    }
-}
-
-// Sound Synthesizer via Web Audio API (No external files needed)
-const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-function playTone(freq, duration, type = 'sine') {
-    try {
-        if (audioCtx.state === 'suspended') audioCtx.resume();
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = type;
-        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start();
-        osc.stop(audioCtx.currentTime + duration);
-    } catch(e) {}
-}
-
-function playWinSound() {
-    playTone(523, 0.1);
-    setTimeout(() => playTone(659, 0.1), 100);
-    setTimeout(() => playTone(783, 0.2), 200);
-}
-
-function playJackpotSound() {
-    [523, 659, 783, 1046, 1318].forEach((f, idx) => {
-        setTimeout(() => playTone(f, 0.25, 'triangle'), idx * 120);
-    });
-}
-
-// Initialize Text Labels securely
-function initText() {
-    document.getElementById("txt_subtitle").textContent = T("%D0%92%D0%98%D0%A0%D0%A2%D0%A3%D0%90%D0%9B%D0%AC%D0%9D%D0%9E%D0%95%20%D0%9A%D0%90%D0%97%D0%98%D0%9D%D0%9E");
-    document.getElementById("txt_bal_label").textContent = T("%D0%91%D0%90%D0%9B%D0%90%D0%9D%D0%A1");
-    document.getElementById("txt_lvl_label").textContent = T("%D0%A3%D0%A0%D0%9E%D0%92%D0%95%D0%BD%D0%BC");
-    document.getElementById("txt_welcome").textContent = T("%D0%A1%D0%B4%D0%B5%D0%BB%D0%B0%D0%B9%D1%82%D0%B5%20%D1%81%D1%82%D0%B0%D0%B2%D0%BA%D1%83%20%D0%B8%20%D0%BD%D0%B0%D0%B6%D0%BC%D0%B8%D1%82%D0%B5%20%D0%9A%D0%A0%D0%A3%D0%A2%D0%98%D0%A2%D0%AC!");
-    document.getElementById("txt_bet_label").textContent = T("%D0%A1%D0%A2%D0%90%D0%92%D0%9A%D0%90:");
-    document.getElementById("spinBtn").textContent = T("%D0%9A%D0%A0%D0%A3%D0%A2%D0%98%D0%A2%D0%AC");
-    document.getElementById("txt_auto_label").textContent = T("%D0%90%D0%92%D0%A2%D0%9E");
-    document.getElementById("txt_gift_label").textContent = T("%D0%91%D0%9E%D0%9D%D0%A3%D0%A1");
-    document.getElementById("txt_info_label").textContent = T("%D0%92%D0%AB%D0%9F%D0%9B%D0%90%D0%A2%D0%AB");
-    document.getElementById("txt_modal_title").textContent = T("%D0%A2%D0%B0%D0%B1%D0%BB%D0%B8%D1%86%D0%B0%20%D0%B2%D1%8B%D0%BF%D0%BB%D0%B0%D1%82");
-}
-
-function loadSave() {
-    try {
-        const saved = localStorage.getItem("royal_slots_save");
-        if (saved) {
-            state = { ...state, ...JSON.parse(saved) };
-        }
-    } catch(e) {}
-    updateUI();
-}
-
-function saveGame() {
-    localStorage.setItem("royal_slots_save", JSON.stringify(state));
-}
-
-function updateUI() {
-    document.getElementById("balance").textContent = state.balance;
-    document.getElementById("level").textContent = state.level;
-}
-
-// Build Reel Strips
-function setupReels() {
-    for (let i = 0; i < 3; i++) {
-        const strip = document.getElementById(`strip${i}`);
-        strip.innerHTML = "";
+# --- ОБРАБОТЧИКИ КОМАНД ---
+async def cmd_start(message: types.Message, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(select(User).where(User.user_id == message.from_user.id))
+            user = result.scalar_one_or_none()
+            if not user:
+                user = User(user_id=message.from_user.id)
+                session.add(user)
         
-        // Populate strip with repeating symbols
-        for (let j = 0; j < 30; j++) {
-            const sym = SYMBOLS[j % SYMBOLS.length];
-            const div = document.createElement("div");
-            div.className = "symbol";
-            div.textContent = sym;
-            strip.appendChild(div);
-        }
-    }
-}
-
-function setBet(amount) {
-    if (isSpinning) return;
-    state.currentBet = amount;
+        await session.commit()
     
-    document.querySelectorAll(".bet-btn").forEach(btn => {
-        btn.classList.toggle("active", parseInt(btn.textContent) === amount);
-    });
-    triggerHaptic();
-}
+    await message.answer(
+        f"Привет, {message.from_user.full_name}! 🎰\n\n"
+        f"Я — бот-слот. Вся валюта виртуальная.\n"
+        f"Ваш текущий баланс: <b>{user.balance}</b> монет.\n\n"
+        f"Как играть:\n"
+        f"Напишите <code>/slots &lt;ставка&gt;</code>, чтобы крутануть барабаны.\n"
+        f"Если не указывать ставку, будет использовано значение по умолчанию ({DEFAULT_BET}).\n"
+        f"Примеры: <code>/slots</code> или <code>/slots 100</code>"
+    )
 
-function userSpin() {
-    if (isSpinning) return;
-    if (state.balance < state.currentBet) {
-        document.getElementById("winBanner").innerHTML = `<span style="color:#e74c3c">${T("%D0%9D%D0%B5%D1%82%20%D0%BC%D0%BE%D0%BD%D0%B5%D1%82!%20%D0%97%D0%B0%D0%B1%D0%B5%D1%80%D0%B8%D1%82%D0%B5%20%D0%B1%D0%BE%D0%BD%D1%83%D1%81%20%D0%B2%D0%BD%D0%B8%D0%B7%D1%83.")}</span>`;
-        if (isAutoSpin) toggleAutoSpin();
-        return;
-    }
+async def play_slots(message: types.Message, state: FSMContext, bet: int):
+    current_time = time.time()
+    user_id = message.from_user.id
 
-    state.balance -= state.currentBet;
-    updateUI();
-    saveGame();
-    startSpin();
-}
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(select(User).where(User.user_id == user_id))
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                await message.answer("Ошибка профиля. Пожалуйста, нажмите /start еще раз.")
+                return
 
-function startSpin() {
-    isSpinning = true;
-    document.getElementById("spinBtn").disabled = true;
-    document.getElementById("winBanner").textContent = T("%D0%92%D1%80%D0%B0%D1%89%D0%B5%D0%BD%D0%B8%D0%B5...");
+            # Защита от повторного нажатия (спам-фильтр)
+            if current_time - user.last_spin_ts < SPAM_TIMEOUT:
+                wait_sec = round(SPAM_TIMEOUT - (current_time - user.last_spin_ts))
+                await message.answer(f"❗ Подождите {wait_sec} секунду(ы) перед следующим вращением.")
+                return
 
-    const results = [
-        Math.floor(Math.random() * SYMBOLS.length),
-        Math.floor(Math.random() * SYMBOLS.length),
-        Math.floor(Math.random() * SYMBOLS.length)
-    ];
+            if bet > user.balance:
+                await message.answer(f"Недостаточно средств. Ваш баланс: {user.balance}.")
+                return
+            
+            if bet <= 0:
+                await message.answer("Ставка должна быть положительным числом.")
+                return
 
-    currentReelIndices = results;
+            # Обновляем время последнего спина ДО отправки сообщения, чтобы защитить от дублей
+            user.last_spin_ts = current_time
+            
+            # Вращение
+            reel1 = secrets.choice(SYMBOLS)
+            reel2 = secrets.choice(SYMBOLS)
+            reel3 = secrets.choice(SYMBOLS)
 
-    for (let i = 0; i < 3; i++) {
-        const strip = document.getElementById(`strip${i}`);
-        const targetIndex = 15 + results[i]; 
-        const targetY = -(targetIndex * 110);
+            is_won, multiplier = check_win([reel1, reel2, reel3])
+            winnings = bet * multiplier
+            
+            new_balance = user.balance - bet + winnings
+            
+            # Записываем новый баланс
+            await session.execute(
+                update(User)
+                .where(User.user_id == user_id)
+                .values(balance=new_balance)
+            )
+        
+        await session.commit()
 
-        strip.style.transition = `transform ${1.2 + i * 0.4}s cubic-bezier(0.15, 0.9, 0.3, 1)`;
-        strip.style.transform = `translateY(${targetY}px)`;
+    # Формируем ответ
+    line_str = f"[{reel1}] [{reel2}] [{reel3}]"
+    status_emoji = "🎉" if is_won else "❌"
+    win_text = f"Выигрыш: +{winnings}" if winnings > 0 else ""
+    
+    reply = (
+        f"{status_emoji} {line_str} {status_emoji}\n\n"
+        f"Ставка: {bet}\n"
+        f"{win_text}\n\n"
+        f"Текущий баланс: <b>{new_balance}</b>"
+    )
+    await message.answer(reply)
 
-        setTimeout(() => playTone(300 + i * 100, 0.05), (1.2 + i * 0.4) * 1000);
-    }
 
-    setTimeout(() => {
-        checkWin(results);
-    }, 2100);
-}
+# --- ЗАПУСК БОТА ---
+async def main():
+    await init_db()
+    
+    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher(storage=MemoryStorage())
 
-function checkWin(results) {
-    isSpinning = false;
-    document.getElementById("spinBtn").disabled = false;
+    dp.message.register(cmd_start, Command(commands={"start"}))
 
-    const sym0 = SYMBOLS[results[0]];
-    const sym1 = SYMBOLS[results[1]];
-    const sym2 = SYMBOLS[results[2]];
+    @dp.message(Command(commands={"slots"}))
+    async def slots_wrapper(message: types.Message, command: CommandObject, state: FSMContext):
+        try:
+            raw_args = command.args or str(DEFAULT_BET)
+            # Извлекаем первое число из текста команды (защита от мусора вроде "/slots 50 abc")
+            parts = raw_args.split()
+            bet = abs(int(parts[0]))
+        except (ValueError, TypeError, IndexError):
+            await message.answer(f"Используйте команду так: /slots [число]. Например: /slots {DEFAULT_BET}")
+            return
+        
+        await play_slots(message, state, bet)
 
-    let winAmount = 0;
-    let message = "";
+    print("✅ Бот успешно запущен!")
+    await dp.start_polling(bot)
 
-    if (sym0 === sym1 && sym1 === sym2) {
-        // 3 of a kind
-        const mult = MULTIPLIERS[sym0];
-        winAmount = state.currentBet * mult;
-
-        if (sym0 === '7пёЏвѓЈ') {
-            message = `рџЋ‰ JACKPOT! +${winAmount} рџЄ™`;
-            playJackpotSound();
-            triggerHaptic('success');
-        } else {
-            message = `рџ”Ґ ${T("%D0%92%D0%AB%D0%98%D0%93%D0%A0%D0%AB%D0%A8")}! +${winAmount} рџЄ™`;
-            playWinSound();
-            triggerHaptic('success');
-        }
-    } else if (sym0 === sym1 || sym1 === sym2 || sym0 === sym2) {
-        // 2 of a kind
-        winAmount = Math.floor(state.currentBet * 1.5);
-        message = `вњЁ ${T("%D0%9C%D0%B0%D0%BB%D1%8B%D0%B9%20%D0%B2%D1%8B%D0%B8%D0%B3%D1%80%D1%8B%D1%88")}: +${winAmount} рџЄ™`;
-        playTone(440, 0.15);
-    } else {
-        message = T("%D0%9F%D0%BE%D0%BF%D1%80%D0%BE%D0%B1%D1%83%D0%B9%D1%82%D0%B5%20%D0%B5%D1%89%D1%91%20%D1%80%D0%B0%D0%B7!");
-    }
-
-    if (winAmount > 0) {
-        state.balance += winAmount;
-    }
-
-    // Add XP for leveling up
-    state.xp += 10;
-    if (state.xp >= state.level * 100) {
-        state.level += 1;
-        state.xp = 0;
-        message += ` (в­ђ ${T("%D0%A3%D1%80%D0%BE%D0%B2%D0%B5%D0%BD%D1%8C")} ${state.level}!)`;
-    }
-
-    document.getElementById("winBanner").textContent = message;
-    updateUI();
-    saveGame();
-
-    // Reset strips position seamlessly
-    for (let i = 0; i < 3; i++) {
-        const strip = document.getElementById(`strip${i}`);
-        strip.style.transition = 'none';
-        strip.style.transform = `translateY(-${results[i] * 110}px)`;
-    }
-
-    if (isAutoSpin) {
-        setTimeout(() => {
-            if (isAutoSpin) userSpin();
-        }, 800);
-    }
-}
-
-function toggleAutoSpin() {
-    isAutoSpin = !isAutoSpin;
-    const btn = document.getElementById("autoBtn");
-    btn.classList.toggle("active", isAutoSpin);
-    triggerHaptic();
-
-    if (isAutoSpin && !isSpinning) {
-        userSpin();
-    }
-}
-
-function claimDailyBonus() {
-    const now = Date.now();
-    const cooldown = 3600 * 1000; // 1 hour cooldown
-
-    if (now - state.lastGiftTime >= cooldown || state.balance === 0) {
-        state.balance += 500;
-        state.lastGiftTime = now;
-        updateUI();
-        saveGame();
-        playWinSound();
-        triggerHaptic('success');
-        document.getElementById("winBanner").innerHTML = `<span style="color:#2ecc71">рџЋЃ ${T("%D0%92%D1%8B%20%D0%BF%D0%BE%D0%BB%D1%83%D1%87%D0%B8%D0%BB%D0%B8")} +500 рџЄ™!</span>`;
-    } else {
-        const leftSec = Math.ceil((cooldown - (now - state.lastGiftTime)) / 1000);
-        const mins = Math.floor(leftSec / 60);
-        document.getElementById("winBanner").textContent = `вЏі ${T("%D0%91%D0%BE%D0%BD%D1%83
+if __name__ == "__main__":
+    asyncio.run(main())
