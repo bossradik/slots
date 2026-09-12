@@ -2,7 +2,9 @@ import os
 import sqlite3
 import random
 import asyncio
+import threading
 from datetime import date
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
@@ -80,9 +82,14 @@ def get_user(user_id, username=""):
     return user
 
 
-def update_user(user_id, balance=None, xp=None, level=None,
-                last_bonus=None, spins=None):
-
+def update_user(
+    user_id,
+    balance=None,
+    xp=None,
+    level=None,
+    last_bonus=None,
+    spins=None
+):
     conn = db()
     cur = conn.cursor()
 
@@ -173,8 +180,7 @@ def game_text(user_id):
 
 @dp.message(F.text == "/start")
 async def start(message: Message):
-
-    user = get_user(
+    get_user(
         message.from_user.id,
         message.from_user.username or ""
     )
@@ -190,7 +196,6 @@ async def start(message: Message):
 
 @dp.message(F.text == "/balance")
 async def balance_command(message: Message):
-
     get_user(
         message.from_user.id,
         message.from_user.username or ""
@@ -205,7 +210,6 @@ async def balance_command(message: Message):
 
 @dp.message(F.text == "/bonus")
 async def bonus_command(message: Message):
-
     await give_bonus(
         message.from_user.id,
         message
@@ -213,7 +217,6 @@ async def bonus_command(message: Message):
 
 
 async def give_bonus(user_id, message_or_call):
-
     user = get_user(user_id)
 
     balance = user[2]
@@ -244,7 +247,6 @@ async def give_bonus(user_id, message_or_call):
         return
 
     reward = 100 + level * 25
-
     balance += reward
 
     update_user(
@@ -283,7 +285,6 @@ async def give_bonus(user_id, message_or_call):
 
 @dp.callback_query(F.data == "bet")
 async def change_bet(call: CallbackQuery):
-
     user_id = call.from_user.id
 
     current = users_bet.get(user_id, 10)
@@ -309,7 +310,6 @@ async def change_bet(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bonus")
 async def bonus_callback(call: CallbackQuery):
-
     await give_bonus(
         call.from_user.id,
         call
@@ -318,7 +318,6 @@ async def bonus_callback(call: CallbackQuery):
 
 @dp.callback_query(F.data == "spin")
 async def spin(call: CallbackQuery):
-
     user_id = call.from_user.id
 
     user = get_user(user_id)
@@ -331,12 +330,10 @@ async def spin(call: CallbackQuery):
     bet = users_bet.get(user_id, 10)
 
     if balance < bet:
-
         await call.answer(
             "❌ Недостаточно монет!",
             show_alert=True
         )
-
         return
 
     balance -= bet
@@ -374,7 +371,11 @@ async def spin(call: CallbackQuery):
 
             result_text = "🎉 ТРИ ОДИНАКОВЫХ!"
 
-    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+    elif (
+        reels[0] == reels[1]
+        or reels[1] == reels[2]
+        or reels[0] == reels[2]
+    ):
 
         win = bet * 2
         result_text = "✨ ДВА ОДИНАКОВЫХ!"
@@ -386,9 +387,7 @@ async def spin(call: CallbackQuery):
     spins += 1
 
     new_level = xp // 100 + 1
-
     level_up = new_level > level
-
     level = new_level
 
     update_user(
@@ -423,7 +422,6 @@ async def spin(call: CallbackQuery):
     )
 
     if level_up:
-
         result += (
             f"\n\n🆙 <b>НОВЫЙ УРОВЕНЬ!</b>\n"
             f"Ты достиг уровня <b>{level}</b>!"
@@ -440,7 +438,6 @@ async def spin(call: CallbackQuery):
 
 @dp.callback_query(F.data == "top")
 async def top(call: CallbackQuery):
-
     conn = db()
     cur = conn.cursor()
 
@@ -455,7 +452,7 @@ async def top(call: CallbackQuery):
 
     conn.close()
 
-    text = "🏆 <b>ТОП ШАХТЁРОВ</b>\n\n"
+    text = "🏆 <b>ТОП ИГРОКОВ</b>\n\n"
 
     if not players:
 
@@ -492,7 +489,6 @@ async def top(call: CallbackQuery):
 
 @dp.callback_query(F.data == "back")
 async def back(call: CallbackQuery):
-
     user_id = call.from_user.id
 
     await call.answer()
@@ -504,9 +500,65 @@ async def back(call: CallbackQuery):
     )
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        if self.path == "/healthz":
+
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8"
+            )
+            self.end_headers()
+
+            self.wfile.write(
+                b"OK"
+            )
+
+        else:
+
+            self.send_response(200)
+            self.end_headers()
+
+            self.wfile.write(
+                b"Slots bot is running"
+            )
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_http_server():
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    print(
+        f"HTTP server started on port {port}"
+    )
+
+    server.serve_forever()
+
+
 async def main():
 
     init_db()
+
+    threading.Thread(
+        target=run_http_server,
+        daemon=True
+    ).start()
 
     print("🎰 Slots bot started!")
 
