@@ -3,29 +3,28 @@ import asyncio
 import random
 import sqlite3
 import threading
-import html
-
 from datetime import datetime, timezone
+from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
-)
+from aiogram.types import Message, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-# =========================
+# =========================================================
 # НАСТРОЙКИ
-# =========================
+# =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в Render")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Render -> Environment."
+    )
 
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -52,12 +51,12 @@ MULTIPLIERS = {
     "7️⃣": 100
 }
 
-BETS = [10, 25, 50, 100]
+VALID_BETS = (10, 25, 50, 100)
 
 
-# =========================
+# =========================================================
 # БАЗА ДАННЫХ
-# =========================
+# =========================================================
 
 db_lock = threading.Lock()
 
@@ -71,7 +70,8 @@ conn.row_factory = sqlite3.Row
 
 with db_lock:
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
@@ -81,14 +81,17 @@ with db_lock:
             last_bonus TEXT DEFAULT '',
             spins INTEGER NOT NULL DEFAULT 0
         )
-    """)
+        """
+    )
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value INTEGER NOT NULL
         )
-    """)
+        """
+    )
 
     conn.execute(
         """
@@ -101,9 +104,9 @@ with db_lock:
     conn.commit()
 
 
-# =========================
-# РАБОТА С ДАННЫМИ
-# =========================
+# =========================================================
+# ФУНКЦИИ БАЗЫ
+# =========================================================
 
 def get_user(user_id, username=""):
 
@@ -122,7 +125,7 @@ def get_user(user_id, username=""):
 
             conn.execute(
                 """
-                INSERT INTO users(
+                INSERT INTO users (
                     user_id,
                     username,
                     balance,
@@ -131,15 +134,7 @@ def get_user(user_id, username=""):
                     last_bonus,
                     spins
                 )
-                VALUES(
-                    ?,
-                    ?,
-                    ?,
-                    0,
-                    1,
-                    '',
-                    0
-                )
+                VALUES (?, ?, ?, 0, 1, '', 0)
                 """,
                 (
                     user_id,
@@ -241,6 +236,9 @@ def get_jackpot():
             """
         ).fetchone()
 
+        if row is None:
+            return JACKPOT_START
+
         return int(row["value"])
 
 
@@ -254,35 +252,20 @@ def set_jackpot(value):
             SET value=?
             WHERE key='jackpot'
             """,
-            (
-                max(0, int(value)),
-            )
+            (max(0, int(value)),)
         )
 
         conn.commit()
 
 
-# =========================
-# УРОВЕНЬ И XP
-# =========================
+# =========================================================
+# ИГРОВЫЕ ФУНКЦИИ
+# =========================================================
 
 def level_from_xp(xp):
 
     return xp // 100 + 1
 
-
-def xp_to_next_level(xp):
-
-    current_level = level_from_xp(xp)
-
-    next_level_xp = current_level * 100
-
-    return next_level_xp - xp
-
-
-# =========================
-# ДАТА
-# =========================
 
 def today():
 
@@ -291,9 +274,9 @@ def today():
     ).strftime("%Y-%m-%d")
 
 
-# =========================
+# =========================================================
 # КЛАВИАТУРА
-# =========================
+# =========================================================
 
 def main_keyboard():
 
@@ -312,7 +295,6 @@ def main_keyboard():
                     text="💰 Ставка 10",
                     callback_data="spin:10"
                 ),
-
                 InlineKeyboardButton(
                     text="💰 Ставка 25",
                     callback_data="spin:25"
@@ -324,7 +306,6 @@ def main_keyboard():
                     text="💰 Ставка 50",
                     callback_data="spin:50"
                 ),
-
                 InlineKeyboardButton(
                     text="💰 Ставка 100",
                     callback_data="spin:100"
@@ -336,7 +317,6 @@ def main_keyboard():
                     text="🎁 Бонус",
                     callback_data="bonus"
                 ),
-
                 InlineKeyboardButton(
                     text="🏆 Рейтинг",
                     callback_data="top"
@@ -348,83 +328,90 @@ def main_keyboard():
                     text="💰 Баланс",
                     callback_data="balance"
                 ),
-
                 InlineKeyboardButton(
                     text="📊 Профиль",
                     callback_data="profile"
                 )
             ]
-
         ]
     )
 
 
-# =========================
-# ТЕКСТ ПРОФИЛЯ
-# =========================
-
-def profile_text(user):
-
-    need_xp = xp_to_next_level(
-        user["xp"]
-    )
-
-    return (
-        "👤 <b>ТВОЙ ПРОФИЛЬ</b>\n\n"
-
-        f"💰 Баланс: "
-        f"<b>{user['balance']}</b> 🪙\n"
-
-        f"⭐ Уровень: "
-        f"<b>{user['level']}</b>\n"
-
-        f"✨ Опыт: "
-        f"<b>{user['xp']}</b> XP\n"
-
-        f"📈 До следующего уровня: "
-        f"<b>{need_xp}</b> XP\n"
-
-        f"🎯 Спинов: "
-        f"<b>{user['spins']}</b>\n\n"
-
-        f"💎 Джекпот: "
-        f"<b>{get_jackpot()}</b> 🪙"
-    )
-
-
-# =========================
-# ПРИВЕТСТВИЕ
-# =========================
+# =========================================================
+# СТАРТОВОЕ СООБЩЕНИЕ
+# =========================================================
 
 def welcome_text(user):
 
     return (
         "🎰 <b>СЛОТЫ</b>\n\n"
-
         "Добро пожаловать в игру!\n\n"
-
-        f"💰 Баланс: "
-        f"<b>{user['balance']}</b> 🪙\n"
-
-        f"⭐ Уровень: "
-        f"<b>{user['level']}</b>\n"
-
-        f"✨ XP: "
-        f"<b>{user['xp']}</b>\n\n"
-
+        f"💰 Баланс: <b>{user['balance']}</b> 🪙\n"
+        f"⭐ Уровень: <b>{user['level']}</b>\n"
+        f"✨ XP: <b>{user['xp']}</b>\n"
+        f"🎯 Спинов: <b>{user['spins']}</b>\n\n"
         "Выбери ставку и крути барабаны! 🎰"
     )
 
 
-# =========================
+# =========================================================
+# ПРОФИЛЬ
+# =========================================================
+
+def profile_text(user):
+
+    next_level_xp = user["level"] * 100
+    current_xp = user["xp"]
+
+    if current_xp >= next_level_xp:
+        xp_text = "Готов к следующему уровню!"
+    else:
+        xp_text = (
+            f"{current_xp} / {next_level_xp}"
+        )
+
+    username = user["username"]
+
+    if username:
+        name = "@" + escape(username)
+    else:
+        name = "Без username"
+
+    return (
+        "📊 <b>ПРОФИЛЬ</b>\n\n"
+        f"👤 Игрок: <b>{name}</b>\n"
+        f"💰 Баланс: <b>{user['balance']}</b> 🪙\n"
+        f"⭐ Уровень: <b>{user['level']}</b>\n"
+        f"✨ XP: <b>{xp_text}</b>\n"
+        f"🎯 Всего спинов: <b>{user['spins']}</b>\n\n"
+        "Чем больше играешь — тем выше уровень!"
+    )
+
+
+# =========================================================
+# БАЛАНС
+# =========================================================
+
+def balance_text(user):
+
+    return (
+        "💰 <b>БАЛАНС</b>\n\n"
+        f"🪙 Монеты: <b>{user['balance']}</b>\n"
+        f"⭐ Уровень: <b>{user['level']}</b>\n"
+        f"✨ XP: <b>{user['xp']}</b>\n"
+        f"🎯 Спинов: <b>{user['spins']}</b>"
+    )
+
+
+# =========================================================
 # ИГРА
-# =========================
+# =========================================================
 
 def spin_result(user_id, bet):
 
     user = get_user(user_id)
 
-    if bet not in BETS:
+    if bet not in VALID_BETS:
 
         return "❌ Неверная ставка."
 
@@ -432,47 +419,43 @@ def spin_result(user_id, bet):
 
         return (
             "❌ <b>Недостаточно монет!</b>\n\n"
-            f"💰 Баланс: "
-            f"<b>{user['balance']}</b> 🪙"
+            f"💰 Твой баланс: <b>{user['balance']}</b> 🪙"
         )
 
     # Барабаны
-
     reels = [
         random.choice(SYMBOLS),
         random.choice(SYMBOLS),
         random.choice(SYMBOLS)
     ]
 
-    # Снимаем ставку
-
+    # Списываем ставку
     balance = user["balance"] - bet
 
-    # Опыт
-
+    # XP
     xp = user["xp"] + 10
 
     # Спины
-
     spins = user["spins"] + 1
 
-    # Джекпот постепенно растёт
+    # Джекпот увеличивается после каждой игры
+    jackpot = get_jackpot()
 
-    jackpot = (
-        get_jackpot()
-        + max(1, bet // 10)
+    jackpot += max(
+        1,
+        bet // 10
     )
 
     win = 0
 
     result_text = (
-        "😐 <b>Проигрыш</b>\n"
-        "Повезёт в следующий раз!"
+        "😐 <b>Ничего!</b>\n"
+        "Попробуй ещё раз."
     )
 
-    # =====================
+    # =====================================================
     # ДЖЕКПОТ
-    # =====================
+    # =====================================================
 
     if (
         reels[0] == "7️⃣"
@@ -485,39 +468,33 @@ def spin_result(user_id, bet):
         jackpot = JACKPOT_START
 
         result_text = (
-            "💥💥💥\n"
             "🎉 <b>ДЖЕКПОТ!</b>\n\n"
-            f"🏆 Ты выиграл "
-            f"<b>{win}</b> 🪙!"
+            f"💎 Ты выиграл <b>{win}</b> 🪙!"
         )
 
-    # =====================
+    # =====================================================
     # ТРИ ОДИНАКОВЫХ
-    # =====================
+    # =====================================================
 
     elif (
-        reels[0]
-        == reels[1]
-        == reels[2]
+        reels[0] == reels[1]
+        and reels[1] == reels[2]
     ):
 
-        multiplier = MULTIPLIERS[
-            reels[0]
-        ]
+        multiplier = MULTIPLIERS[reels[0]]
 
         win = bet * multiplier
 
         result_text = (
             "🔥 <b>ТРИ ОДИНАКОВЫХ!</b>\n\n"
-            f"🎯 Множитель: "
-            f"<b>x{multiplier}</b>\n"
-            f"💰 Выигрыш: "
-            f"<b>{win}</b> 🪙"
+            f"{reels[0]} {reels[1]} {reels[2]}\n\n"
+            f"💰 Выигрыш: <b>{win}</b> 🪙\n"
+            f"⚡ Множитель: <b>x{multiplier}</b>"
         )
 
-    # =====================
+    # =====================================================
     # ДВА ОДИНАКОВЫХ
-    # =====================
+    # =====================================================
 
     elif (
         reels[0] == reels[1]
@@ -529,21 +506,22 @@ def spin_result(user_id, bet):
 
         result_text = (
             "✨ <b>ДВА ОДИНАКОВЫХ!</b>\n\n"
-            f"💰 Выигрыш: "
-            f"<b>{win}</b> 🪙"
+            f"{reels[0]} {reels[1]} {reels[2]}\n\n"
+            f"💰 Выигрыш: <b>{win}</b> 🪙"
         )
 
     # Добавляем выигрыш
-
     balance += win
 
-    new_level = level_from_xp(xp)
+    # Новый уровень
+    level = level_from_xp(xp)
 
+    # Сохраняем
     update_user(
         user_id,
         balance=balance,
         xp=xp,
-        level=new_level,
+        level=level,
         spins=spins
     )
 
@@ -551,50 +529,22 @@ def spin_result(user_id, bet):
 
     new_user = get_user(user_id)
 
-    level_up_text = ""
-
-    if new_level > user["level"]:
-
-        level_up_text = (
-            "\n\n🎉 <b>НОВЫЙ УРОВЕНЬ!</b>\n"
-            f"⭐ Теперь ты "
-            f"<b>{new_level} уровня</b>!"
-        )
-
     return (
         "🎰 <b>СЛОТЫ</b>\n\n"
-
-        f"┃ {reels[0]} "
-        f"┃ {reels[1]} "
-        f"┃ {reels[2]} ┃\n\n"
-
-        f"{result_text}"
-
-        f"{level_up_text}\n\n"
-
-        f"💸 Ставка: "
-        f"<b>{bet}</b> 🪙\n"
-
-        f"💰 Баланс: "
-        f"<b>{new_user['balance']}</b> 🪙\n"
-
-        f"⭐ Уровень: "
-        f"<b>{new_user['level']}</b>\n"
-
-        f"✨ XP: "
-        f"<b>{new_user['xp']}</b>\n"
-
-        f"🎯 Спинов: "
-        f"<b>{new_user['spins']}</b>\n"
-
-        f"💎 Джекпот: "
-        f"<b>{get_jackpot()}</b> 🪙"
+        f"┃ {reels[0]} ┃ {reels[1]} ┃ {reels[2]} ┃\n\n"
+        f"{result_text}\n\n"
+        f"💸 Ставка: <b>{bet}</b> 🪙\n"
+        f"💰 Баланс: <b>{new_user['balance']}</b> 🪙\n"
+        f"⭐ Уровень: <b>{new_user['level']}</b>\n"
+        f"✨ XP: <b>{new_user['xp']}</b>\n"
+        f"🎯 Спинов: <b>{new_user['spins']}</b>\n"
+        f"💎 Джекпот: <b>{get_jackpot()}</b> 🪙"
     )
 
 
-# =========================
+# =========================================================
 # ЕЖЕДНЕВНЫЙ БОНУС
-# =========================
+# =========================================================
 
 def bonus_result(user_id):
 
@@ -610,15 +560,9 @@ def bonus_result(user_id):
             "⏰ Возвращайся завтра!"
         )
 
-    reward = (
-        100
-        + user["level"] * 25
-    )
+    reward = 100 + user["level"] * 25
 
-    new_balance = (
-        user["balance"]
-        + reward
-    )
+    new_balance = user["balance"] + reward
 
     update_user(
         user_id,
@@ -628,18 +572,14 @@ def bonus_result(user_id):
 
     return (
         "🎁 <b>ЕЖЕДНЕВНЫЙ БОНУС!</b>\n\n"
-
-        f"💰 Получено: "
-        f"<b>+{reward}</b> 🪙\n\n"
-
-        f"💳 Новый баланс: "
-        f"<b>{new_balance}</b> 🪙"
+        f"🎉 Ты получил <b>+{reward}</b> 🪙!\n\n"
+        f"💰 Новый баланс: <b>{new_balance}</b> 🪙"
     )
 
 
-# =========================
+# =========================================================
 # РЕЙТИНГ
-# =========================
+# =========================================================
 
 def top_result():
 
@@ -647,13 +587,7 @@ def top_result():
 
         rows = conn.execute(
             """
-            SELECT
-                username,
-                user_id,
-                balance,
-                level,
-                xp,
-                spins
+            SELECT username, user_id, balance, level, spins
             FROM users
             ORDER BY balance DESC
             LIMIT 10
@@ -665,7 +599,7 @@ def top_result():
         return "🏆 Пока игроков нет."
 
     lines = [
-        "🏆 <b>ТОП-10 ШАХТЁРОВ СЛОТОВ</b>\n"
+        "🏆 <b>ТОП-10 ШАХТЁРОВ</b>\n"
     ]
 
     medals = [
@@ -674,46 +608,45 @@ def top_result():
         "🥉"
     ]
 
-    for i, row in enumerate(
-        rows,
-        1
-    ):
+    for i, row in enumerate(rows, 1):
 
-        name = (
-            row["username"]
-            or f"Игрок {str(row['user_id'])[-4:]}"
-        )
+        username = row["username"]
 
-        name = html.escape(name)
+        if username:
 
-        if i <= 3:
-
-            prefix = medals[i - 1]
+            name = "@" + escape(username)
 
         else:
 
-            prefix = f"<b>{i}.</b>"
+            name = (
+                f"Игрок {str(row['user_id'])[-4:]}"
+            )
+
+        if i <= 3:
+            medal = medals[i - 1]
+        else:
+            medal = f"{i}."
 
         lines.append(
-            f"{prefix} {name}\n"
-            f"   💰 {row['balance']} 🪙"
-            f" | ⭐ {row['level']}"
-            f" | ✨ {row['xp']} XP"
+            f"{medal} <b>{name}</b>\n"
+            f"   💰 {row['balance']} 🪙 | "
+            f"⭐ Ур. {row['level']} | "
+            f"🎯 {row['spins']}"
         )
 
     return "\n".join(lines)
 
 
-# =========================
-# DISPATCHER
-# =========================
+# =========================================================
+# TELEGRAM
+# =========================================================
 
 dp = Dispatcher()
 
 
-# =========================
-# /START
-# =========================
+# =========================================================
+# /start
+# =========================================================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -729,9 +662,9 @@ async def cmd_start(message: Message):
     )
 
 
-# =========================
-# /BALANCE
-# =========================
+# =========================================================
+# /balance
+# =========================================================
 
 @dp.message(Command("balance"))
 async def cmd_balance(message: Message):
@@ -742,14 +675,14 @@ async def cmd_balance(message: Message):
     )
 
     await message.answer(
-        profile_text(user),
+        balance_text(user),
         reply_markup=main_keyboard()
     )
 
 
-# =========================
-# /BONUS
-# =========================
+# =========================================================
+# /bonus
+# =========================================================
 
 @dp.message(Command("bonus"))
 async def cmd_bonus(message: Message):
@@ -764,9 +697,9 @@ async def cmd_bonus(message: Message):
     )
 
 
-# =========================
-# /TOP
-# =========================
+# =========================================================
+# /top
+# =========================================================
 
 @dp.message(Command("top"))
 async def cmd_top(message: Message):
@@ -777,34 +710,12 @@ async def cmd_top(message: Message):
     )
 
 
-# =========================
-# /PROFILE
-# =========================
+# =========================================================
+# КРУТИТЬ
+# =========================================================
 
-@dp.message(Command("profile"))
-async def cmd_profile(message: Message):
-
-    user = get_user(
-        message.from_user.id,
-        message.from_user.username or ""
-    )
-
-    await message.answer(
-        profile_text(user),
-        reply_markup=main_keyboard()
-    )
-
-
-# =========================
-# КНОПКА СЛОТОВ
-# =========================
-
-@dp.callback_query(
-    F.data.startswith("spin:")
-)
-async def cb_spin(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data.startswith("spin:"))
+async def cb_spin(callback: CallbackQuery):
 
     try:
 
@@ -838,16 +749,12 @@ async def cb_spin(
         )
 
 
-# =========================
-# КНОПКА БОНУСА
-# =========================
+# =========================================================
+# БОНУС
+# =========================================================
 
-@dp.callback_query(
-    F.data == "bonus"
-)
-async def cb_bonus(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "bonus")
+async def cb_bonus(callback: CallbackQuery):
 
     text = bonus_result(
         callback.from_user.id
@@ -863,16 +770,12 @@ async def cb_bonus(
         )
 
 
-# =========================
-# КНОПКА БАЛАНСА
-# =========================
+# =========================================================
+# БАЛАНС
+# =========================================================
 
-@dp.callback_query(
-    F.data == "balance"
-)
-async def cb_balance(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "balance")
+async def cb_balance(callback: CallbackQuery):
 
     user = get_user(
         callback.from_user.id,
@@ -884,47 +787,17 @@ async def cb_balance(
     if callback.message:
 
         await callback.message.edit_text(
-            profile_text(user),
+            balance_text(user),
             reply_markup=main_keyboard()
         )
 
 
-# =========================
-# КНОПКА ПРОФИЛЯ
-# =========================
+# =========================================================
+# РЕЙТИНГ
+# =========================================================
 
-@dp.callback_query(
-    F.data == "profile"
-)
-async def cb_profile(
-    callback: CallbackQuery
-):
-
-    user = get_user(
-        callback.from_user.id,
-        callback.from_user.username or ""
-    )
-
-    await callback.answer()
-
-    if callback.message:
-
-        await callback.message.edit_text(
-            profile_text(user),
-            reply_markup=main_keyboard()
-        )
-
-
-# =========================
-# КНОПКА РЕЙТИНГА
-# =========================
-
-@dp.callback_query(
-    F.data == "top"
-)
-async def cb_top(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "top")
+async def cb_top(callback: CallbackQuery):
 
     await callback.answer()
 
@@ -936,33 +809,64 @@ async def cb_top(
         )
 
 
-# =========================
-# HEALTH SERVER ДЛЯ RENDER
-# =========================
+# =========================================================
+# ПРОФИЛЬ
+# =========================================================
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
+@dp.callback_query(F.data == "profile")
+async def cb_profile(callback: CallbackQuery):
+
+    user = get_user(
+        callback.from_user.id,
+        callback.from_user.username or ""
+    )
+
+    await callback.answer()
+
+    if callback.message:
+
+        await callback.message.edit_text(
+            profile_text(user),
+            reply_markup=main_keyboard()
+        )
+
+
+# =========================================================
+# HEALTH SERVER ДЛЯ RENDER
+# =========================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        body = b"OK"
+        if self.path in (
+            "/",
+            "/healthz"
+        ):
 
-        self.send_response(200)
+            body = b"OK"
 
-        self.send_header(
-            "Content-Type",
-            "text/plain"
-        )
+            self.send_response(200)
 
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8"
+            )
 
-        self.end_headers()
+            self.send_header(
+                "Content-Length",
+                str(len(body))
+            )
 
-        self.wfile.write(body)
+            self.end_headers()
+
+            self.wfile.write(body)
+
+        else:
+
+            self.send_response(404)
+
+            self.end_headers()
 
     def log_message(
         self,
@@ -984,24 +888,29 @@ def start_health_server():
     )
 
     print(
-        f"HTTP server started on port {PORT}"
+        f"Health server started on port {PORT}"
     )
 
     server.serve_forever()
 
 
-# =========================
-# ЗАПУСК
-# =========================
+# =========================================================
+# MAIN
+# =========================================================
 
 async def main():
 
-    print(
-        "BOT_TOKEN найден."
-    )
+    print("BOT_TOKEN найден.")
 
     print(
         f"PORT: {PORT}"
+    )
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        )
     )
 
     health_thread = threading.Thread(
@@ -1011,14 +920,16 @@ async def main():
 
     health_thread.start()
 
-    bot = Bot(TOKEN)
-
     print(
-        "Telegram bot started!"
+        "Telegram bot starting..."
     )
 
     await dp.start_polling(bot)
 
+
+# =========================================================
+# ЗАПУСК
+# =========================================================
 
 if __name__ == "__main__":
 
