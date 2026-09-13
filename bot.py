@@ -4,7 +4,6 @@ import random
 import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
-from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from aiogram import Bot, Dispatcher, F
@@ -13,381 +12,182 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 
-# =========================================================
-# НАСТРОЙКИ
-# =========================================================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 DB_FILE = "slots.db"
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не найден в Render -> Environment.")
+
+BET_VALUES = (10, 25, 50, 100)
+SYMBOLS = ("🍒", "🍋", "🍊", "🔔", "💎", "7️⃣")
+MULTIPLIERS = {"🍒": 5, "🍋": 7, "🍊": 10, "🔔": 15, "💎": 30, "7️⃣": 100}
 START_BALANCE = 1000
 JACKPOT_START = 5000
 
-BET_VALUES = (
-    10,
-    25,
-    50,
-    100
-)
-
-SYMBOLS = [
-    "🍒",
-    "🍋",
-    "🍊",
-    "🔔",
-    "💎",
-    "7️⃣"
-]
-
-MULTIPLIERS = {
-    "🍒": 5,
-    "🍋": 7,
-    "🍊": 10,
-    "🔔": 15,
-    "💎": 30,
-    "7️⃣": 100
-}
-
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не найден в Render -> Environment."
-    )
-
-
-# =========================================================
-# БАЗА ДАННЫХ
-# =========================================================
-
-db_lock = threading.RLock()
-
-db = sqlite3.connect(
-    DB_FILE,
-    check_same_thread=False
-)
-
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.row_factory = sqlite3.Row
+lock = threading.RLock()
 
 
-with db_lock:
+def now():
+    return datetime.now(timezone.utc)
 
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            first_name TEXT DEFAULT '',
-            balance INTEGER NOT NULL DEFAULT 1000,
-            xp INTEGER NOT NULL DEFAULT 0,
-            level INTEGER NOT NULL DEFAULT 1,
-            last_bonus TEXT DEFAULT '',
-            bonus_streak INTEGER NOT NULL DEFAULT 0,
-            spins INTEGER NOT NULL DEFAULT 0,
-            wins INTEGER NOT NULL DEFAULT 0,
-            total_won INTEGER NOT NULL DEFAULT 0,
-            best_win INTEGER NOT NULL DEFAULT 0,
-            current_streak INTEGER NOT NULL DEFAULT 0,
-            best_streak INTEGER NOT NULL DEFAULT 0,
-            pickaxe INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT DEFAULT ''
+
+def day():
+    return now().strftime("%Y-%m-%d")
+
+
+def init_db():
+    with lock:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT DEFAULT '',
+                first_name TEXT DEFAULT '',
+                balance INTEGER DEFAULT 1000,
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                last_bonus TEXT DEFAULT '',
+                bonus_streak INTEGER DEFAULT 0,
+                spins INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                total_won INTEGER DEFAULT 0,
+                best_win INTEGER DEFAULT 0,
+                win_streak INTEGER DEFAULT 0,
+                best_streak INTEGER DEFAULT 0,
+                gear INTEGER DEFAULT 1
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                user_id INTEGER,
+                task_day TEXT,
+                spins INTEGER DEFAULT 0,
+                won INTEGER DEFAULT 0,
+                big_wins INTEGER DEFAULT 0,
+                claimed_spins INTEGER DEFAULT 0,
+                claimed_won INTEGER DEFAULT 0,
+                claimed_big INTEGER DEFAULT 0,
+                PRIMARY KEY(user_id, task_day)
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS achievements (
+                user_id INTEGER,
+                name TEXT,
+                PRIMARY KEY(user_id, name)
+            )
+        """)
+
+        db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('jackpot', ?)",
+            (JACKPOT_START,)
         )
-        """
-    )
 
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value INTEGER NOT NULL
-        )
-        """
-    )
-
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS achievements (
-            user_id INTEGER NOT NULL,
-            achievement_id TEXT NOT NULL,
-            PRIMARY KEY(user_id, achievement_id)
-        )
-        """
-    )
-
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_tasks (
-            user_id INTEGER NOT NULL,
-            day TEXT NOT NULL,
-            spins INTEGER DEFAULT 0,
-            won INTEGER DEFAULT 0,
-            big_win INTEGER DEFAULT 0,
-            spins_claimed INTEGER DEFAULT 0,
-            won_claimed INTEGER DEFAULT 0,
-            big_win_claimed INTEGER DEFAULT 0,
-            PRIMARY KEY(user_id, day)
-        )
-        """
-    )
-
-    db.execute(
-        """
-        INSERT OR IGNORE INTO settings(key, value)
-        VALUES('jackpot', ?)
-        """,
-        (JACKPOT_START,)
-    )
-
-    db.commit()
+        db.commit()
 
 
-# =========================================================
-# МИГРАЦИЯ СТАРОЙ БАЗЫ
-# =========================================================
+def ensure_columns():
+    required = {
+        "username": "TEXT DEFAULT ''",
+        "first_name": "TEXT DEFAULT ''",
+        "balance": "INTEGER DEFAULT 1000",
+        "xp": "INTEGER DEFAULT 0",
+        "level": "INTEGER DEFAULT 1",
+        "last_bonus": "TEXT DEFAULT ''",
+        "bonus_streak": "INTEGER DEFAULT 0",
+        "spins": "INTEGER DEFAULT 0",
+        "wins": "INTEGER DEFAULT 0",
+        "total_won": "INTEGER DEFAULT 0",
+        "best_win": "INTEGER DEFAULT 0",
+        "win_streak": "INTEGER DEFAULT 0",
+        "best_streak": "INTEGER DEFAULT 0",
+        "gear": "INTEGER DEFAULT 1",
+    }
 
-def ensure_column(
-    name,
-    definition
-):
-
-    with db_lock:
-
+    with lock:
         columns = {
-            row["name"]
-            for row in db.execute(
-                "PRAGMA table_info(users)"
-            ).fetchall()
+            r["name"]
+            for r in db.execute("PRAGMA table_info(users)")
         }
 
-        if name not in columns:
+        for name, definition in required.items():
+            if name not in columns:
+                db.execute(
+                    f"ALTER TABLE users ADD COLUMN {name} {definition}"
+                )
 
-            db.execute(
-                f"""
-                ALTER TABLE users
-                ADD COLUMN {name} {definition}
-                """
-            )
-
-            db.commit()
+        db.commit()
 
 
-old_columns = [
-    (
-        "username",
-        "TEXT DEFAULT ''"
-    ),
-    (
-        "first_name",
-        "TEXT DEFAULT ''"
-    ),
-    (
-        "balance",
-        "INTEGER NOT NULL DEFAULT 1000"
-    ),
-    (
-        "xp",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "level",
-        "INTEGER NOT NULL DEFAULT 1"
-    ),
-    (
-        "last_bonus",
-        "TEXT DEFAULT ''"
-    ),
-    (
-        "bonus_streak",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "spins",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "wins",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "total_won",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "best_win",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "current_streak",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "best_streak",
-        "INTEGER NOT NULL DEFAULT 0"
-    ),
-    (
-        "pickaxe",
-        "INTEGER NOT NULL DEFAULT 1"
-    ),
-    (
-        "created_at",
-        "TEXT DEFAULT ''"
-    )
-]
-
-
-for column_name, column_definition in old_columns:
-
-    ensure_column(
-        column_name,
-        column_definition
-    )
-
-
-# =========================================================
-# ВРЕМЯ
-# =========================================================
-
-def utc_now():
-
-    return datetime.now(
-        timezone.utc
-    )
-
-
-def current_day():
-
-    return utc_now().strftime(
-        "%Y-%m-%d"
-    )
-
-
-# =========================================================
-# ПОЛЬЗОВАТЕЛИ
-# =========================================================
-
-def get_user(
-    user_id,
-    username="",
-    first_name=""
-):
-
-    with db_lock:
-
+def get_user(user_id, username="", first_name=""):
+    with lock:
         row = db.execute(
-            """
-            SELECT *
-            FROM users
-            WHERE user_id=?
-            """,
+            "SELECT * FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
 
         if row is None:
-
             db.execute(
                 """
                 INSERT INTO users(
                     user_id,
                     username,
                     first_name,
-                    balance,
-                    xp,
-                    level,
-                    pickaxe,
-                    created_at
+                    balance
                 )
-                VALUES(
-                    ?,
-                    ?,
-                    ?,
-                    ?,
-                    0,
-                    1,
-                    1,
-                    ?
-                )
+                VALUES(?,?,?,?)
                 """,
                 (
                     user_id,
                     username or "",
                     first_name or "",
-                    START_BALANCE,
-                    utc_now().isoformat()
+                    START_BALANCE
                 )
             )
 
             db.commit()
 
             row = db.execute(
-                """
-                SELECT *
-                FROM users
-                WHERE user_id=?
-                """,
+                "SELECT * FROM users WHERE user_id=?",
                 (user_id,)
             ).fetchone()
 
         else:
+            db.execute(
+                """
+                UPDATE users
+                SET username=?, first_name=?
+                WHERE user_id=?
+                """,
+                (
+                    username or row["username"],
+                    first_name or row["first_name"],
+                    user_id
+                )
+            )
 
-            changed = False
+            db.commit()
 
-            if username:
-
-                if row["username"] != username:
-
-                    db.execute(
-                        """
-                        UPDATE users
-                        SET username=?
-                        WHERE user_id=?
-                        """,
-                        (
-                            username,
-                            user_id
-                        )
-                    )
-
-                    changed = True
-
-            if first_name:
-
-                if row["first_name"] != first_name:
-
-                    db.execute(
-                        """
-                        UPDATE users
-                        SET first_name=?
-                        WHERE user_id=?
-                        """,
-                        (
-                            first_name,
-                            user_id
-                        )
-                    )
-
-                    changed = True
-
-            if changed:
-
-                db.commit()
-
-                row = db.execute(
-                    """
-                    SELECT *
-                    FROM users
-                    WHERE user_id=?
-                    """,
-                    (user_id,)
-                ).fetchone()
+            row = db.execute(
+                "SELECT * FROM users WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
 
         return dict(row)
 
 
-def update_user(
-    user_id,
-    **fields
-):
-
+def update_user(user_id, **fields):
     allowed = {
         "username",
         "first_name",
@@ -400,39 +200,33 @@ def update_user(
         "wins",
         "total_won",
         "best_win",
-        "current_streak",
+        "win_streak",
         "best_streak",
-        "pickaxe"
+        "gear"
     }
 
     fields = {
-        key: value
-        for key, value in fields.items()
-        if key in allowed
+        k: v
+        for k, v in fields.items()
+        if k in allowed
     }
 
     if not fields:
         return
 
-    columns = ", ".join(
-        f"{key}=?"
-        for key in fields
+    sql = ", ".join(
+        f"{k}=?"
+        for k in fields
     )
 
-    values = list(
-        fields.values()
-    )
+    values = list(fields.values())
+    values.append(user_id)
 
-    values.append(
-        user_id
-    )
-
-    with db_lock:
-
+    with lock:
         db.execute(
             f"""
             UPDATE users
-            SET {columns}
+            SET {sql}
             WHERE user_id=?
             """,
             values
@@ -441,207 +235,69 @@ def update_user(
         db.commit()
 
 
-def display_name(user):
-
-    if user.get("username"):
-
-        return "@" + user["username"]
-
-    if user.get("first_name"):
-
-        return user["first_name"]
-
-    return (
-        "Игрок "
-        + str(user["user_id"])[-4:]
-    )
-
-
-# =========================================================
-# XP И УРОВЕНЬ
-# =========================================================
-
-def level_from_xp(xp):
-
-    return xp // 100 + 1
-
-
-def xp_progress(xp):
-
-    return xp % 100
-
-
-# =========================================================
-# ДЖЕКПОТ
-# =========================================================
-
-def get_jackpot():
-
-    with db_lock:
-
+def jackpot():
+    with lock:
         row = db.execute(
-            """
-            SELECT value
-            FROM settings
-            WHERE key='jackpot'
-            """
+            "SELECT value FROM settings WHERE key='jackpot'"
         ).fetchone()
 
-        if row is None:
+        return int(row["value"])
 
-            db.execute(
-                """
-                INSERT INTO settings(
-                    key,
-                    value
-                )
-                VALUES(
-                    'jackpot',
-                    ?
-                )
-                """,
-                (JACKPOT_START,)
-            )
 
-            db.commit()
-
-            return JACKPOT_START
-
-        return int(
-            row["value"]
+def add_jackpot(amount):
+    with lock:
+        db.execute(
+            """
+            UPDATE settings
+            SET value=value+?
+            WHERE key='jackpot'
+            """,
+            (amount,)
         )
 
+        db.commit()
 
-def set_jackpot(value):
 
-    with db_lock:
-
+def reset_jackpot():
+    with lock:
         db.execute(
             """
             UPDATE settings
             SET value=?
             WHERE key='jackpot'
             """,
-            (
-                max(
-                    0,
-                    int(value)
-                ),
-            )
+            (JACKPOT_START,)
         )
 
         db.commit()
 
 
-def add_jackpot(value):
+def name(user):
+    if user["username"]:
+        return "@" + user["username"]
 
-    set_jackpot(
-        get_jackpot()
-        + int(value)
-    )
+    return user["first_name"] or "Игрок"
 
 
-# =========================================================
-# КЛАВИАТУРЫ
-# =========================================================
+def level(xp):
+    return xp // 100 + 1
+
 
 def main_keyboard():
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
                     text="🎰 ИГРАТЬ",
-                    callback_data="menu:spin"
+                    callback_data="spin_menu"
                 )
             ],
 
             [
                 InlineKeyboardButton(
-                    text="💰 Ставка 10",
-                    callback_data="bet:10"
-                ),
-                InlineKeyboardButton(
-                    text="💰 Ставка 25",
-                    callback_data="bet:25"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="💰 Ставка 50",
-                    callback_data="bet:50"
-                ),
-                InlineKeyboardButton(
-                    text="💰 Ставка 100",
-                    callback_data="bet:100"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="👤 Профиль",
-                    callback_data="menu:profile"
-                ),
-                InlineKeyboardButton(
-                    text="🎁 Бонус",
-                    callback_data="menu:bonus"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="📋 Задания",
-                    callback_data="menu:tasks"
-                ),
-                InlineKeyboardButton(
-                    text="🏆 Топ",
-                    callback_data="menu:top"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="⛏️ Экипировка",
-                    callback_data="menu:gear"
-                ),
-                InlineKeyboardButton(
-                    text="💎 Джекпот",
-                    callback_data="menu:jackpot"
-                )
-            ]
-        ]
-    )
-
-
-def back_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ В меню",
-                    callback_data="menu:home"
-                )
-            ]
-        ]
-    )
-
-
-def spin_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="🎰 КРУТИТЬ — 10",
+                    text="💰 10",
                     callback_data="spin:10"
-                )
-            ],
-
-            [
+                ),
                 InlineKeyboardButton(
                     text="💰 25",
                     callback_data="spin:25"
@@ -658,303 +314,92 @@ def spin_keyboard():
 
             [
                 InlineKeyboardButton(
-                    text="⬅️ В меню",
-                    callback_data="menu:home"
-                )
-            ]
-        ]
-    )
-
-
-# =========================================================
-# ГЛАВНОЕ МЕНЮ
-# =========================================================
-
-def home_text(user):
-
-    return (
-        "🎰 <b>СЛОТЫ</b>\n\n"
-
-        f"👤 {escape(display_name(user))}\n"
-
-        f"💰 Баланс: "
-        f"<b>{user['balance']}</b> 🪙\n"
-
-        f"⭐ Уровень: "
-        f"<b>{user['level']}</b>\n"
-
-        f"✨ XP: "
-        f"<b>{xp_progress(user['xp'])}/100</b>\n"
-
-        f"🎰 Спинов: "
-        f"<b>{user['spins']}</b>\n\n"
-
-        "Выбери действие:"
-    )
-
-
-# =========================================================
-# ПРОФИЛЬ
-# =========================================================
-
-def profile_text(user):
-
-    return (
-        "👤 <b>ПРОФИЛЬ</b>\n\n"
-
-        f"Имя: "
-        f"<b>{escape(display_name(user))}</b>\n\n"
-
-        f"💰 Баланс: "
-        f"<b>{user['balance']}</b> 🪙\n"
-
-        f"⭐ Уровень: "
-        f"<b>{user['level']}</b>\n"
-
-        f"✨ XP: "
-        f"<b>{xp_progress(user['xp'])}/100</b>\n"
-
-        f"🎰 Спинов: "
-        f"<b>{user['spins']}</b>\n"
-
-        f"🏆 Побед: "
-        f"<b>{user['wins']}</b>\n"
-
-        f"💎 Всего выиграно: "
-        f"<b>{user['total_won']}</b> 🪙\n"
-
-        f"🔥 Серия побед: "
-        f"<b>{user['current_streak']}</b>\n"
-
-        f"🏅 Лучшая серия: "
-        f"<b>{user['best_streak']}</b>\n"
-
-        f"🥇 Лучший выигрыш: "
-        f"<b>{user['best_win']}</b> 🪙"
-    )
-
-
-# =========================================================
-# ЭКИПИРОВКА
-# =========================================================
-
-def gear_text(user):
-
-    level = user["pickaxe"]
-
-    cost = 500 * level
-
-    power = 1 + level
-
-    return (
-        "⛏️ <b>ЭКИПИРОВКА</b>\n\n"
-
-        f"⛏️ Уровень: "
-        f"<b>{level}</b>\n"
-
-        f"⚡ Сила: "
-        f"<b>{power}</b>\n"
-
-        f"💰 Следующее улучшение: "
-        f"<b>{cost}</b> 🪙\n\n"
-
-        "Улучшение даёт больше XP "
-        "за каждый спин."
-    )
-
-
-def gear_keyboard(user):
-
-    cost = 500 * user["pickaxe"]
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
+                    text="👤 Профиль",
+                    callback_data="profile"
+                ),
                 InlineKeyboardButton(
-                    text=f"⬆️ Улучшить за {cost} 🪙",
-                    callback_data="gear:up"
+                    text="🎁 Бонус",
+                    callback_data="bonus"
                 )
             ],
 
             [
                 InlineKeyboardButton(
-                    text="⬅️ В меню",
-                    callback_data="menu:home"
+                    text="📋 Задания",
+                    callback_data="tasks"
+                ),
+                InlineKeyboardButton(
+                    text="🏆 ТОП",
+                    callback_data="top"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⛏️ Экипировка",
+                    callback_data="gear"
+                ),
+                InlineKeyboardButton(
+                    text="💎 Джекпот",
+                    callback_data="jackpot"
                 )
             ]
         ]
     )
 
 
-# =========================================================
-# ДОСТИЖЕНИЯ
-# =========================================================
-
-ACHIEVEMENTS = {
-
-    "first":
-        (
-            "🎰 Первый спин",
-            50
-        ),
-
-    "100":
-        (
-            "🎯 100 спинов",
-            250
-        ),
-
-    "1000":
-        (
-            "🔥 1000 спинов",
-            1000
-        ),
-
-    "rich":
-        (
-            "💰 10 000 монет",
-            500
-        ),
-
-    "big":
-        (
-            "💎 Выигрыш 1000+",
-            500
-        ),
-
-    "jackpot":
-        (
-            "👑 Джекпот",
-            5000
-        ),
-
-    "level10":
-        (
-            "⭐ Уровень 10",
-            1000
-        )
-}
-
-
-def unlock_achievement(
-    user_id,
-    achievement_id
-):
-
-    if achievement_id not in ACHIEVEMENTS:
-
-        return False
-
-    with db_lock:
-
-        cursor = db.execute(
-            """
-            INSERT OR IGNORE INTO achievements(
-                user_id,
-                achievement_id
-            )
-            VALUES(
-                ?,
-                ?
-            )
-            """,
-            (
-                user_id,
-                achievement_id
-            )
-        )
-
-        db.commit()
-
-        return cursor.rowcount > 0
-
-
-def check_achievements(
-    user_id
-):
-
-    user = get_user(
-        user_id
+def back_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В меню",
+                    callback_data="home"
+                )
+            ]
+        ]
     )
 
-    ids = []
 
-    if user["spins"] >= 1:
-        ids.append("first")
-
-    if user["spins"] >= 100:
-        ids.append("100")
-
-    if user["spins"] >= 1000:
-        ids.append("1000")
-
-    if user["balance"] >= 10000:
-        ids.append("rich")
-
-    if user["best_win"] >= 1000:
-        ids.append("big")
-
-    if user["level"] >= 10:
-        ids.append("level10")
-
-    messages = []
-
-    for achievement_id in ids:
-
-        if unlock_achievement(
-            user_id,
-            achievement_id
-        ):
-
-            reward = ACHIEVEMENTS[
-                achievement_id
-            ][1]
-
-            current = get_user(
-                user_id
-            )
-
-            update_user(
-                user_id,
-                balance=current["balance"] + reward
-            )
-
-            messages.append(
-                f"{ACHIEVEMENTS[achievement_id][0]} "
-                f"— +{reward} 🪙"
-            )
-
-    return messages
+def home_text(user):
+    return (
+        "🎰 СЛОТЫ\n\n"
+        f"👤 {name(user)}\n"
+        f"💰 Баланс: {user['balance']} 🪙\n"
+        f"⭐ Уровень: {user['level']}\n"
+        f"✨ XP: {user['xp'] % 100}/100\n"
+        f"🎰 Спинов: {user['spins']}\n\n"
+        "Выбери ставку или действие:"
+    )
 
 
-# =========================================================
-# ЕЖЕДНЕВНЫЕ ЗАДАНИЯ
-# =========================================================
+def profile_text(user):
+    return (
+        "👤 ПРОФИЛЬ\n\n"
+        f"Имя: {name(user)}\n"
+        f"💰 Баланс: {user['balance']} 🪙\n"
+        f"⭐ Уровень: {user['level']}\n"
+        f"✨ XP: {user['xp'] % 100}/100\n"
+        f"🎰 Спинов: {user['spins']}\n"
+        f"🏆 Побед: {user['wins']}\n"
+        f"💎 Всего выиграно: {user['total_won']} 🪙\n"
+        f"🔥 Серия: {user['win_streak']}\n"
+        f"🏅 Лучшая серия: {user['best_streak']}\n"
+        f"🥇 Лучший выигрыш: {user['best_win']} 🪙"
+    )
 
-def get_daily_task(
-    user_id
-):
 
-    today = current_day()
-
-    with db_lock:
-
+def get_task(user_id):
+    with lock:
         db.execute(
             """
-            INSERT OR IGNORE INTO daily_tasks(
+            INSERT OR IGNORE INTO tasks(
                 user_id,
-                day
+                task_day
             )
-            VALUES(
-                ?,
-                ?
-            )
+            VALUES(?,?)
             """,
-            (
-                user_id,
-                today
-            )
+            (user_id, day())
         )
 
         db.commit()
@@ -962,60 +407,512 @@ def get_daily_task(
         row = db.execute(
             """
             SELECT *
-            FROM daily_tasks
+            FROM tasks
             WHERE user_id=?
-            AND day=?
+            AND task_day=?
             """,
-            (
-                user_id,
-                today
-            )
+            (user_id, day())
         ).fetchone()
 
-    return dict(row)
+        return dict(row)
 
 
-def update_daily_task(
-    user_id,
-    spins=0,
-    won=0,
-    big_win=0
-):
+def task_update(user_id, spins=0, won=0, big=0):
+    get_task(user_id)
 
-    today = current_day()
-
-    with db_lock:
-
+    with lock:
         db.execute(
             """
-            INSERT OR IGNORE INTO daily_tasks(
-                user_id,
-                day
-            )
-            VALUES(
-                ?,
-                ?
-            )
-            """,
-            (
-                user_id,
-                today
-            )
-        )
-
-        db.execute(
-            """
-            UPDATE daily_tasks
+            UPDATE tasks
             SET
                 spins=spins+?,
                 won=won+?,
-                big_win=big_win+?
+                big_wins=big_wins+?
             WHERE user_id=?
-            AND day=?
+            AND task_day=?
             """,
             (
                 spins,
                 won,
-                big_win,
+                big,
                 user_id,
-     
+                day()
+            )
+        )
+
+        db.commit()
+
+
+def task_reward(user_id):
+    task = get_task(user_id)
+    reward = 0
+
+    with lock:
+        if task["spins"] >= 10 and not task["claimed_spins"]:
+            reward += 100
+
+            db.execute(
+                """
+                UPDATE tasks
+                SET claimed_spins=1
+                WHERE user_id=?
+                AND task_day=?
+                """,
+                (user_id, day())
+            )
+
+        if task["won"] >= 500 and not task["claimed_won"]:
+            reward += 200
+
+            db.execute(
+                """
+                UPDATE tasks
+                SET claimed_won=1
+                WHERE user_id=?
+                AND task_day=?
+                """,
+                (user_id, day())
+            )
+
+        if task["big_wins"] >= 1 and not task["claimed_big"]:
+            reward += 500
+
+            db.execute(
+                """
+                UPDATE tasks
+                SET claimed_big=1
+                WHERE user_id=?
+                AND task_day=?
+                """,
+                (user_id, day())
+            )
+
+        db.commit()
+
+    if reward:
+        user = get_user(user_id)
+
+        update_user(
+            user_id,
+            balance=user["balance"] + reward
+        )
+
+    return reward
+
+
+def tasks_text(user_id):
+    t = get_task(user_id)
+
+    return (
+        "📋 ЕЖЕДНЕВНЫЕ ЗАДАНИЯ\n\n"
+        f"{'✅' if t['claimed_spins'] else '⏳'} "
+        f"10 спинов: {min(t['spins'], 10)}/10 — +100 🪙\n"
+        f"{'✅' if t['claimed_won'] else '⏳'} "
+        f"Выиграть 500: {min(t['won'], 500)}/500 — +200 🪙\n"
+        f"{'✅' if t['claimed_big'] else '⏳'} "
+        f"Выигрыш 1000+: {min(t['big_wins'], 1)}/1 — +500 🪙"
+    )
+
+
+def claim_bonus(user_id):
+    user = get_user(user_id)
+
+    if user["last_bonus"] == day():
+        return (
+            0,
+            user["bonus_streak"],
+            user["balance"]
+        )
+
+    yesterday = (
+        now() - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    if user["last_bonus"] == yesterday:
+        streak = user["bonus_streak"] + 1
+    else:
+        streak = 1
+
+    amount = (
+        100
+        + user["level"] * 25
+        + min(streak, 7) * 10
+    )
+
+    new_balance = user["balance"] + amount
+
+    update_user(
+        user_id,
+        balance=new_balance,
+        last_bonus=day(),
+        bonus_streak=streak
+    )
+
+    return (
+        amount,
+        streak,
+        new_balance
+    )
+
+
+def achievement(user_id, key, reward):
+    with lock:
+        cur = db.execute(
+            """
+            INSERT OR IGNORE INTO achievements(
+                user_id,
+                name
+            )
+            VALUES(?,?)
+            """,
+            (user_id, key)
+        )
+
+        db.commit()
+
+        new = cur.rowcount == 1
+
+    if new:
+        user = get_user(user_id)
+
+        update_user(
+            user_id,
+            balance=user["balance"] + reward
+        )
+
+    return new
+
+
+def check_achievements(user_id):
+    user = get_user(user_id)
+    messages = []
+
+    checks = [
+        (
+            "first",
+            user["spins"] >= 1,
+            "🎰 Первый спин",
+            50
+        ),
+        (
+            "100",
+            user["spins"] >= 100,
+            "🎯 100 спинов",
+            250
+        ),
+        (
+            "1000",
+            user["spins"] >= 1000,
+            "🔥 1000 спинов",
+            1000
+        ),
+        (
+            "rich",
+            user["balance"] >= 10000,
+            "💰 10 000 монет",
+            500
+        ),
+        (
+            "big",
+            user["best_win"] >= 1000,
+            "💎 Выигрыш 1000+",
+            500
+        ),
+        (
+            "level10",
+            user["level"] >= 10,
+            "⭐ Уровень 10",
+            1000
+        )
+    ]
+
+    for key, ok, title, reward in checks:
+        if ok and achievement(user_id, key, reward):
+            messages.append(
+                f"{title} — +{reward} 🪙"
+            )
+
+    return messages
+
+
+def spin(user_id, bet):
+    user = get_user(user_id)
+
+    if bet not in BET_VALUES:
+        return "❌ Неверная ставка."
+
+    if user["balance"] < bet:
+        return (
+            f"❌ Недостаточно монет. "
+            f"Нужно {bet} 🪙."
+        )
+
+    result = [
+        random.choice(SYMBOLS)
+        for _ in range(3)
+    ]
+
+    win = 0
+
+    jackpot_win = (
+        result == [
+            "7️⃣",
+            "7️⃣",
+            "7️⃣"
+        ]
+    )
+
+    if jackpot_win:
+        win = jackpot()
+
+    elif (
+        result[0]
+        == result[1]
+        == result[2]
+    ):
+        win = (
+            bet
+            * MULTIPLIERS[result[0]]
+        )
+
+    elif (
+        result[0] == result[1]
+        or result[0] == result[2]
+        or result[1] == result[2]
+    ):
+        win = bet * 2
+
+    xp_gain = 10 + user["gear"]
+    new_xp = user["xp"] + xp_gain
+    new_level = level(new_xp)
+
+    if win:
+        streak = user["win_streak"] + 1
+    else:
+        streak = 0
+
+    best_streak = max(
+        user["best_streak"],
+        streak
+    )
+
+    new_balance = (
+        user["balance"]
+        - bet
+        + win
+    )
+
+    update_user(
+        user_id,
+        balance=new_balance,
+        xp=new_xp,
+        level=new_level,
+        spins=user["spins"] + 1,
+        wins=user["wins"] + (1 if win else 0),
+        total_won=user["total_won"] + win,
+        best_win=max(user["best_win"], win),
+        win_streak=streak,
+        best_streak=best_streak
+    )
+
+    add_jackpot(
+        max(
+            1,
+            bet // 50
+        )
+    )
+
+    if jackpot_win:
+        reset_jackpot()
+        achievement(
+            user_id,
+            "jackpot",
+            5000
+        )
+
+    task_update(
+        user_id,
+        spins=1,
+        won=win,
+        big=int(win >= 1000)
+    )
+
+    reward = task_reward(user_id)
+    achievements = check_achievements(user_id)
+
+    if jackpot_win:
+        title = "👑 ДЖЕКПОТ!!!"
+    elif win:
+        title = "🎉 ПОБЕДА!"
+    else:
+        title = "😔 Не повезло"
+
+    text = (
+        f"{title}\n\n"
+        f"🎰 {' | '.join(result)}\n\n"
+        f"💰 Ставка: {bet} 🪙\n"
+        f"🏆 Выигрыш: {win} 🪙\n"
+        f"⭐ +{xp_gain} XP\n"
+        f"💳 Баланс: {new_balance} 🪙"
+    )
+
+    if new_level > user["level"]:
+        text += (
+            f"\n\n🆙 НОВЫЙ УРОВЕНЬ: "
+            f"{new_level}!"
+        )
+
+    if streak >= 2:
+        text += (
+            f"\n🔥 Серия побед: "
+            f"{streak}"
+        )
+
+    if reward:
+        text += (
+            f"\n🎁 Задания: "
+            f"+{reward} 🪙"
+        )
+
+    if achievements:
+        text += (
+            "\n\n🏅 "
+            + "\n🏅 ".join(achievements)
+        )
+
+    return text
+
+
+def top_text():
+    with lock:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM users
+            ORDER BY balance DESC, wins DESC
+            LIMIT 10
+            """
+        ).fetchall()
+
+    if not rows:
+        return (
+            "🏆 ТОП\n\n"
+            "Пока игроков нет."
+        )
+
+    text = "🏆 ТОП ИГРОКОВ\n\n"
+    medals = ("🥇", "🥈", "🥉")
+
+    for i, row in enumerate(rows, 1):
+        if i <= 3:
+            prefix = medals[i - 1]
+        else:
+            prefix = f"{i}."
+
+        text += (
+            f"{prefix} "
+            f"{name(dict(row))} — "
+            f"{row['balance']} 🪙\n"
+        )
+
+    return text
+
+
+def gear_text(user):
+    cost = 500 * user["gear"]
+    power = 1 + user["gear"]
+
+    return (
+        "⛏️ ЭКИПИРОВКА\n\n"
+        f"Уровень: {user['gear']}\n"
+        f"⚡ Сила: {power}\n"
+        f"💰 Следующее улучшение: "
+        f"{cost} 🪙"
+    )
+
+
+def gear_keyboard(user):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"⬆️ Улучшить за "
+                        f"{500 * user['gear']} 🪙"
+                    ),
+                    callback_data="gear_up"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В меню",
+                    callback_data="home"
+                )
+            ]
+        ]
+    )
+
+
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+@dp.message(Command("slots"))
+async def start(message: Message):
+    user = get_user(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.first_name or ""
+    )
+
+    await message.answer(
+        home_text(user),
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.message(Command("balance"))
+async def balance(message: Message):
+    user = get_user(
+        message.from_user.id
+    )
+
+    await message.answer(
+        f"💰 Твой баланс: "
+        f"{user['balance']} 🪙",
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.message(Command("bonus"))
+async def bonus_command(message: Message):
+    amount, streak, balance_value = claim_bonus(
+        message.from_user.id
+    )
+
+    if amount:
+        text = (
+            "🎁 БОНУС\n\n"
+            f"+{amount} 🪙\n"
+            f"🔥 Серия: {streak}\n"
+            f"💰 Баланс: {balance_value} 🪙"
+        )
+    else:
+        text = (
+            "⏳ Бонус уже получен сегодня."
+        )
+
+    await message.answer(
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.message(Command("top"))
+async def top_command(message: Message):
+    await message.answer(
+        top_text(),
+        reply_markup=back_keyboard()
+    )
+    
