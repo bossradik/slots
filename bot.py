@@ -12,10 +12,6 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.client.default import DefaultBotProperties
 
 
-# =========================================================
-# НАСТРОЙКИ
-# =========================================================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 if not BOT_TOKEN:
@@ -52,10 +48,6 @@ MULTIPLIERS = {
 }
 
 
-# =========================================================
-# БАЗА ДАННЫХ
-# =========================================================
-
 db_lock = threading.RLock()
 
 conn = sqlite3.connect(
@@ -66,9 +58,20 @@ conn = sqlite3.connect(
 conn.row_factory = sqlite3.Row
 
 
-# =========================================================
-# СОЗДАНИЕ ТАБЛИЦ
-# =========================================================
+def add_column_if_missing(table, column, definition):
+    cols = {
+        r["name"]
+        for r in conn.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    }
+
+    if column not in cols:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+        conn.commit()
+
 
 with db_lock:
 
@@ -151,54 +154,27 @@ with db_lock:
     conn.commit()
 
 
-# =========================================================
-# АВТОМАТИЧЕСКАЯ ПРОВЕРКА СТАРОЙ БАЗЫ
-# =========================================================
+for col, definition in [
+    ("first_name", "TEXT DEFAULT ''"),
+    ("balance", "INTEGER NOT NULL DEFAULT 1000"),
+    ("xp", "INTEGER NOT NULL DEFAULT 0"),
+    ("level", "INTEGER NOT NULL DEFAULT 1"),
+    ("last_bonus", "TEXT DEFAULT ''"),
+    ("bonus_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("spins", "INTEGER NOT NULL DEFAULT 0"),
+    ("wins", "INTEGER NOT NULL DEFAULT 0"),
+    ("total_won", "INTEGER NOT NULL DEFAULT 0"),
+    ("best_win", "INTEGER NOT NULL DEFAULT 0"),
+    ("current_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("best_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("created_at", "TEXT DEFAULT ''"),
+]:
+    add_column_if_missing(
+        "users",
+        col,
+        definition
+    )
 
-def ensure_column(table_name, column_name, column_type):
-    with db_lock:
-
-        columns = conn.execute(
-            f"PRAGMA table_info({table_name})"
-        ).fetchall()
-
-        existing = {
-            row["name"]
-            for row in columns
-        }
-
-        if column_name not in existing:
-
-            conn.execute(
-                f"""
-                ALTER TABLE {table_name}
-                ADD COLUMN {column_name} {column_type}
-                """
-            )
-
-            conn.commit()
-
-
-# На случай если старая версия базы уже существует
-ensure_column("users", "username", "TEXT DEFAULT ''")
-ensure_column("users", "first_name", "TEXT DEFAULT ''")
-ensure_column("users", "balance", "INTEGER NOT NULL DEFAULT 1000")
-ensure_column("users", "xp", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "level", "INTEGER NOT NULL DEFAULT 1")
-ensure_column("users", "last_bonus", "TEXT DEFAULT ''")
-ensure_column("users", "bonus_streak", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "spins", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "wins", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "total_won", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "best_win", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "current_streak", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "best_streak", "INTEGER NOT NULL DEFAULT 0")
-ensure_column("users", "created_at", "TEXT DEFAULT ''")
-
-
-# =========================================================
-# ВРЕМЯ
-# =========================================================
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -207,10 +183,6 @@ def now_utc():
 def today():
     return now_utc().strftime("%Y-%m-%d")
 
-
-# =========================================================
-# ПОЛЬЗОВАТЕЛИ
-# =========================================================
 
 def get_user(
     user_id,
@@ -263,62 +235,45 @@ def get_user(
 
             conn.commit()
 
-            row = conn.execute(
-                """
-                SELECT *
-                FROM users
-                WHERE user_id=?
-                """,
-                (user_id,)
-            ).fetchone()
-
         else:
 
-            changed = False
-
-            if username and row["username"] != username:
-
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET username=?
-                    WHERE user_id=?
-                    """,
-                    (username, user_id)
-                )
-
-                changed = True
-
-            if first_name and row["first_name"] != first_name:
+            if (
+                username != row["username"]
+                or first_name != row["first_name"]
+            ):
 
                 conn.execute(
                     """
                     UPDATE users
-                    SET first_name=?
+                    SET username=?,
+                        first_name=?
                     WHERE user_id=?
                     """,
-                    (first_name, user_id)
+                    (
+                        username or "",
+                        first_name or "",
+                        user_id
+                    )
                 )
-
-                changed = True
-
-            if changed:
 
                 conn.commit()
 
-                row = conn.execute(
-                    """
-                    SELECT *
-                    FROM users
-                    WHERE user_id=?
-                    """,
-                    (user_id,)
-                ).fetchone()
+        row = conn.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()
 
         return dict(row)
 
 
-def update_user(user_id, **fields):
+def update_user(
+    user_id,
+    **fields
+):
 
     allowed = {
         "username",
@@ -345,7 +300,7 @@ def update_user(user_id, **fields):
     if not fields:
         return
 
-    columns = ", ".join(
+    sql = ", ".join(
         f"{key}=?"
         for key in fields
     )
@@ -358,7 +313,7 @@ def update_user(user_id, **fields):
         conn.execute(
             f"""
             UPDATE users
-            SET {columns}
+            SET {sql}
             WHERE user_id=?
             """,
             values
@@ -367,14 +322,10 @@ def update_user(user_id, **fields):
         conn.commit()
 
 
-# =========================================================
-# ЧАТЫ
-# =========================================================
-
-def register_chat_member(chat_id, user_id):
-
-    if chat_id is None:
-        return
+def register_member(
+    chat_id,
+    user_id
+):
 
     with db_lock:
 
@@ -395,81 +346,6 @@ def register_chat_member(chat_id, user_id):
         conn.commit()
 
 
-# =========================================================
-# ИМЯ
-# =========================================================
-
-def display_name(user):
-
-    if user.get("username"):
-        return "@" + user["username"]
-
-    if user.get("first_name"):
-        return user["first_name"]
-
-    return "Игрок " + str(user["user_id"])[-4:]
-
-
-# =========================================================
-# ПОЛУЧЕНИЕ USER ИЗ MESSAGE
-# =========================================================
-
-def user_from_message(message: Message):
-
-    user = get_user(
-        message.from_user.id,
-        message.from_user.username or "",
-        message.from_user.first_name or ""
-    )
-
-    register_chat_member(
-        message.chat.id,
-        message.from_user.id
-    )
-
-    return user
-
-
-# =========================================================
-# ПОЛУЧЕНИЕ USER ИЗ CALLBACK
-# =========================================================
-
-def user_from_callback(callback: CallbackQuery):
-
-    user = get_user(
-        callback.from_user.id,
-        callback.from_user.username or "",
-        callback.from_user.first_name or ""
-    )
-
-    if callback.message:
-
-        register_chat_member(
-            callback.message.chat.id,
-            callback.from_user.id
-        )
-
-    return user
-
-
-# =========================================================
-# УРОВЕНЬ
-# =========================================================
-
-def level_from_xp(xp):
-
-    return xp // 100 + 1
-
-
-def xp_progress(xp):
-
-    return xp % 100
-
-
-# =========================================================
-# ДЖЕКПОТ
-# =========================================================
-
 def get_jackpot():
 
     with db_lock:
@@ -482,21 +358,9 @@ def get_jackpot():
             """
         ).fetchone()
 
-        if row is None:
-
-            conn.execute(
-                """
-                INSERT INTO settings(key, value)
-                VALUES('jackpot', ?)
-                """,
-                (JACKPOT_START,)
-            )
-
-            conn.commit()
-
-            return JACKPOT_START
-
-        return int(row["value"])
+        return int(
+            row["value"]
+        )
 
 
 def set_jackpot(value):
@@ -509,15 +373,40 @@ def set_jackpot(value):
             SET value=?
             WHERE key='jackpot'
             """,
-            (max(0, int(value)),)
+            (
+                max(
+                    0,
+                    int(value)
+                ),
+            )
         )
 
         conn.commit()
 
 
-# =========================================================
-# ДОСТИЖЕНИЯ
-# =========================================================
+def level_from_xp(xp):
+
+    return xp // 100 + 1
+
+
+def xp_progress(xp):
+
+    return xp % 100
+
+
+def name_of(user):
+
+    if user.get("username"):
+        return "@" + user["username"]
+
+    if user.get("first_name"):
+        return user["first_name"]
+
+    return (
+        "Игрок "
+        + str(user["user_id"] % 10000)
+    )
+
 
 ACHIEVEMENTS = {
 
@@ -553,13 +442,13 @@ ACHIEVEMENTS = {
 
     "big_win": (
         "💎 Большой выигрыш",
-        "Выиграть 1000+ монет за один спин",
+        "Выиграть 1000+ монет за спин",
         500
     ),
 
     "lucky": (
         "🍀 Счастливчик",
-        "Получить три одинаковых символа",
+        "Получить три одинаковых",
         300
     ),
 
@@ -583,13 +472,10 @@ ACHIEVEMENTS = {
 }
 
 
-def unlock_achievement(
+def unlock(
     user_id,
     achievement_id
 ):
-
-    if achievement_id not in ACHIEVEMENTS:
-        return False
 
     with db_lock:
 
@@ -614,7 +500,7 @@ def unlock_achievement(
         return cursor.rowcount > 0
 
 
-def get_achievement_ids(user_id):
+def achievements_for(user_id):
 
     with db_lock:
 
@@ -627,20 +513,24 @@ def get_achievement_ids(user_id):
             (user_id,)
         ).fetchall()
 
-    return [
-        row["achievement_id"]
-        for row in rows
-    ]
+        return {
+            row["achievement_id"]
+            for row in rows
+        }
 
 
 def check_achievements(
     user_id,
-    force_ids=None
+    forced=()
 ):
 
-    user = get_user(user_id)
+    user = get_user(
+        user_id
+    )
 
-    ids = set(force_ids or [])
+    ids = set(
+        forced
+    )
 
     if user["spins"] >= 1:
         ids.add("first_spin")
@@ -666,46 +556,45 @@ def check_achievements(
     if user["level"] >= 10:
         ids.add("level_10")
 
-    messages = []
+    result = []
 
     for achievement_id in ids:
 
         if achievement_id not in ACHIEVEMENTS:
             continue
 
-        unlocked = unlock_achievement(
+        if unlock(
             user_id,
             achievement_id
-        )
-
-        if unlocked:
+        ):
 
             reward = ACHIEVEMENTS[
                 achievement_id
             ][2]
 
-            current = get_user(user_id)
+            current = get_user(
+                user_id
+            )
 
             update_user(
                 user_id,
-                balance=current["balance"] + reward
+                balance=(
+                    current["balance"]
+                    + reward
+                )
             )
 
-            messages.append(
+            result.append(
                 f"{ACHIEVEMENTS[achievement_id][0]} "
                 f"— +{reward} 🪙"
             )
 
-    return messages
+    return result
 
 
-# =========================================================
-# ЕЖЕДНЕВНЫЕ ЗАДАНИЯ
-# =========================================================
+def get_task(user_id):
 
-def get_daily_task(user_id):
-
-    current_day = today()
+    date = today()
 
     with db_lock:
 
@@ -719,7 +608,7 @@ def get_daily_task(user_id):
             """,
             (
                 user_id,
-                current_day
+                date
             )
         )
 
@@ -734,21 +623,21 @@ def get_daily_task(user_id):
             """,
             (
                 user_id,
-                current_day
+                date
             )
         ).fetchone()
 
-    return dict(row)
+        return dict(row)
 
 
-def update_daily_task(
+def update_task(
     user_id,
     spins=0,
     won=0,
-    big_win=0
+    big=0
 ):
 
-    current_day = today()
+    date = today()
 
     with db_lock:
 
@@ -762,7 +651,7 @@ def update_daily_task(
             """,
             (
                 user_id,
-                current_day
+                date
             )
         )
 
@@ -779,28 +668,30 @@ def update_daily_task(
             (
                 spins,
                 won,
-                big_win,
+                big,
                 user_id,
-                current_day
+                date
             )
         )
 
         conn.commit()
 
 
-def claim_daily_task_rewards(user_id):
+def claim_tasks(user_id):
 
-    task = get_daily_task(user_id)
+    task = get_task(
+        user_id
+    )
 
     reward = 0
 
-    current_day = today()
+    date = today()
 
     with db_lock:
 
         if (
             task["spins"] >= 10
-            and task["spins_claimed"] == 0
+            and not task["spins_claimed"]
         ):
 
             reward += 100
@@ -814,13 +705,13 @@ def claim_daily_task_rewards(user_id):
                 """,
                 (
                     user_id,
-                    current_day
+                    date
                 )
             )
 
         if (
             task["won"] >= 500
-            and task["won_claimed"] == 0
+            and not task["won_claimed"]
         ):
 
             reward += 200
@@ -834,13 +725,13 @@ def claim_daily_task_rewards(user_id):
                 """,
                 (
                     user_id,
-                    current_day
+                    date
                 )
             )
 
         if (
             task["big_win"] >= 1
-            and task["big_win_claimed"] == 0
+            and not task["big_win_claimed"]
         ):
 
             reward += 500
@@ -854,7 +745,7 @@ def claim_daily_task_rewards(user_id):
                 """,
                 (
                     user_id,
-                    current_day
+                    date
                 )
             )
 
@@ -862,75 +753,20 @@ def claim_daily_task_rewards(user_id):
 
     if reward:
 
-        user = get_user(user_id)
+        user = get_user(
+            user_id
+        )
 
         update_user(
             user_id,
-            balance=user["balance"] + reward
+            balance=(
+                user["balance"]
+                + reward
+            )
         )
 
     return reward
 
-
-def tasks_text(user_id):
-
-    task = get_daily_task(user_id)
-
-    spins = min(
-        task["spins"],
-        10
-    )
-
-    won = min(
-        task["won"],
-        500
-    )
-
-    big_win = min(
-        task["big_win"],
-        1
-    )
-
-    spin_mark = (
-        "✅"
-        if task["spins_claimed"]
-        else "⏳"
-    )
-
-    won_mark = (
-        "✅"
-        if task["won_claimed"]
-        else "⏳"
-    )
-
-    big_mark = (
-        "✅"
-        if task["big_win_claimed"]
-        else "⏳"
-    )
-
-    return (
-        "🎯 <b>ЕЖЕДНЕВНЫЕ ЗАДАНИЯ</b>\n\n"
-
-        f"{spin_mark} 🎰 Сделать 10 спинов: "
-        f"<b>{spins}/10</b>\n"
-        "🎁 Награда: <b>+100</b> 🪙\n\n"
-
-        f"{won_mark} 💰 Выиграть 500 монет: "
-        f"<b>{won}/500</b>\n"
-        "🎁 Награда: <b>+200</b> 🪙\n\n"
-
-        f"{big_mark} 💎 Выигрыш 1000+: "
-        f"<b>{big_win}/1</b>\n"
-        "🎁 Награда: <b>+500</b> 🪙\n\n"
-
-        "Награды выдаются автоматически."
-    )
-
-
-# =========================================================
-# КЛАВИАТУРЫ
-# =========================================================
 
 def main_keyboard():
 
@@ -949,6 +785,7 @@ def main_keyboard():
                     text="💰 Ставка 10",
                     callback_data="spin:10"
                 ),
+
                 InlineKeyboardButton(
                     text="💰 Ставка 25",
                     callback_data="spin:25"
@@ -957,4 +794,230 @@ def main_keyboard():
 
             [
                 InlineKeyboardButton(
-                    text="💰 Став
+                    text="💰 Ставка 50",
+                    callback_data="spin:50"
+                ),
+
+                InlineKeyboardButton(
+                    text="💰 Ставка 100",
+                    callback_data="spin:100"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎁 Бонус",
+                    callback_data="bonus"
+                ),
+
+                InlineKeyboardButton(
+                    text="🏆 Рейтинг",
+                    callback_data="top"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="📊 Профиль",
+                    callback_data="profile"
+                ),
+
+                InlineKeyboardButton(
+                    text="🎯 Задания",
+                    callback_data="tasks"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🏅 Достижения",
+                    callback_data="achievements"
+                ),
+
+                InlineKeyboardButton(
+                    text="💎 Джекпот",
+                    callback_data="jackpot"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="💰 Баланс",
+                    callback_data="balance"
+                )
+            ]
+        ]
+    )
+
+
+def top_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text="💰 Баланс",
+                    callback_data="top:balance"
+                ),
+
+                InlineKeyboardButton(
+                    text="⭐ Уровень",
+                    callback_data="top:level"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎰 Спины",
+                    callback_data="top:spins"
+                ),
+
+                InlineKeyboardButton(
+                    text="🏆 Выигрыши",
+                    callback_data="top:wins"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="home"
+                )
+            ]
+        ]
+    )
+
+
+def welcome(user):
+
+    return (
+        "🎰 <b>СЛОТЫ</b>\n\n"
+
+        "Добро пожаловать в игру!\n\n"
+
+        f"💰 Баланс: "
+        f"<b>{user['balance']}</b> 🪙\n"
+
+        f"⭐ Уровень: "
+        f"<b>{user['level']}</b>\n"
+
+        f"✨ XP: "
+        f"<b>{xp_progress(user['xp'])}/100</b>\n"
+
+        f"🎯 Спинов: "
+        f"<b>{user['spins']}</b>\n\n"
+
+        "Выбери ставку и крути барабаны! 🎰"
+    )
+
+
+def profile_text(user_id):
+
+    user = get_user(
+        user_id
+    )
+
+    return (
+        "📊 <b>ПРОФИЛЬ</b>\n\n"
+
+        f"👤 {name_of(user)}\n"
+
+        f"💰 Баланс: "
+        f"<b>{user['balance']}</b> 🪙\n"
+
+        f"⭐ Уровень: "
+        f"<b>{user['level']}</b>\n"
+
+        f"✨ XP: "
+        f"<b>{xp_progress(user['xp'])}/100</b>\n"
+
+        f"🎰 Спинов: "
+        f"<b>{user['spins']}</b>\n"
+
+        f"🏆 Побед: "
+        f"<b>{user['wins']}</b>\n"
+
+        f"💵 Всего выиграно: "
+        f"<b>{user['total_won']}</b> 🪙\n"
+
+        f"💎 Лучший выигрыш: "
+        f"<b>{user['best_win']}</b> 🪙\n"
+
+        f"🔥 Серия: "
+        f"<b>{user['current_streak']}</b>\n"
+
+        f"🔥 Лучшая серия: "
+        f"<b>{user['best_streak']}</b>\n"
+
+        f"🏅 Достижений: "
+        f"<b>{len(achievements_for(user_id))}</b>"
+    )
+
+
+def tasks_text(user_id):
+
+    task = get_task(
+        user_id
+    )
+
+    return (
+        "🎯 <b>ЕЖЕДНЕВНЫЕ ЗАДАНИЯ</b>\n\n"
+
+        f"{'✅' if task['spins_claimed'] else '⏳'} "
+        f"🎰 10 спинов: "
+        f"<b>{min(task['spins'], 10)}/10</b> "
+        f"— +100 🪙\n\n"
+
+        f"{'✅' if task['won_claimed'] else '⏳'} "
+        f"💰 Выиграть 500: "
+        f"<b>{min(task['won'], 500)}/500</b> "
+        f"— +200 🪙\n\n"
+
+        f"{'✅' if task['big_win_claimed'] else '⏳'} "
+        f"💎 Выигрыш 1000+: "
+        f"<b>{min(task['big_win'], 1)}/1</b> "
+        f"— +500 🪙"
+    )
+
+
+def achievements_text(user_id):
+
+    unlocked = achievements_for(
+        user_id
+    )
+
+    lines = [
+        "🏅 <b>ДОСТИЖЕНИЯ</b>\n"
+    ]
+
+    for achievement_id, data in ACHIEVEMENTS.items():
+
+        title = data[0]
+        description = data[1]
+        reward = data[2]
+
+        mark = (
+            "✅"
+            if achievement_id in unlocked
+            else "🔒"
+        )
+
+        lines.append(
+            f"{mark} <b>{title}</b>\n"
+            f"{description}\n"
+            f"🎁 +{reward} 🪙"
+        )
+
+    return "\n\n".join(
+        lines
+    )
+
+
+def jackpot_text():
+
+    return (
+        "💎 <b>ДЖЕКПОТ</b>\n\n"
+
+        f"💰 Сейчас: "
+        f"<b>{get_jackpo
