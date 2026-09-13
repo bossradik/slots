@@ -8,12 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 
 
@@ -21,19 +16,14 @@ from aiogram.client.default import DefaultBotProperties
 # НАСТРОЙКИ
 # =========================================================
 
-ENV = {
-    str(k).strip(): str(v).strip()
-    for k, v in os.environ.items()
-}
-
-BOT_TOKEN = ENV.get("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN не найден. Добавь BOT_TOKEN в Render -> Environment."
     )
 
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(os.getenv("PORT", "10000"))
 
 DB_FILE = "slots.db"
 
@@ -76,102 +66,134 @@ conn = sqlite3.connect(
 conn.row_factory = sqlite3.Row
 
 
+# =========================================================
+# СОЗДАНИЕ ТАБЛИЦ
+# =========================================================
+
 with db_lock:
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
             first_name TEXT DEFAULT '',
-
             balance INTEGER NOT NULL DEFAULT 1000,
-
             xp INTEGER NOT NULL DEFAULT 0,
             level INTEGER NOT NULL DEFAULT 1,
-
             last_bonus TEXT DEFAULT '',
             bonus_streak INTEGER NOT NULL DEFAULT 0,
-
             spins INTEGER NOT NULL DEFAULT 0,
             wins INTEGER NOT NULL DEFAULT 0,
-
             total_won INTEGER NOT NULL DEFAULT 0,
             best_win INTEGER NOT NULL DEFAULT 0,
-
             current_streak INTEGER NOT NULL DEFAULT 0,
             best_streak INTEGER NOT NULL DEFAULT 0,
-
             created_at TEXT DEFAULT ''
         )
-    """)
+        """
+    )
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value INTEGER NOT NULL
         )
-    """)
+        """
+    )
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS achievements (
             user_id INTEGER NOT NULL,
             achievement_id TEXT NOT NULL,
             unlocked_at TEXT DEFAULT '',
-
-            PRIMARY KEY (
-                user_id,
-                achievement_id
-            )
+            PRIMARY KEY (user_id, achievement_id)
         )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_tasks (
-            user_id INTEGER NOT NULL,
-            task_date TEXT NOT NULL,
-
-            spins INTEGER NOT NULL DEFAULT 0,
-            won INTEGER NOT NULL DEFAULT 0,
-            big_win INTEGER NOT NULL DEFAULT 0,
-
-            spins_claimed INTEGER NOT NULL DEFAULT 0,
-            won_claimed INTEGER NOT NULL DEFAULT 0,
-            big_win_claimed INTEGER NOT NULL DEFAULT 0,
-
-            PRIMARY KEY (
-                user_id,
-                task_date
-            )
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_members (
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-
-            PRIMARY KEY (
-                chat_id,
-                user_id
-            )
-        )
-    """)
+        """
+    )
 
     conn.execute(
         """
-        INSERT OR IGNORE INTO settings(
-            key,
-            value
+        CREATE TABLE IF NOT EXISTS daily_tasks (
+            user_id INTEGER NOT NULL,
+            task_date TEXT NOT NULL,
+            spins INTEGER NOT NULL DEFAULT 0,
+            won INTEGER NOT NULL DEFAULT 0,
+            big_win INTEGER NOT NULL DEFAULT 0,
+            spins_claimed INTEGER NOT NULL DEFAULT 0,
+            won_claimed INTEGER NOT NULL DEFAULT 0,
+            big_win_claimed INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, task_date)
         )
-        VALUES(
-            'jackpot',
-            ?
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_members (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, user_id)
         )
+        """
+    )
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO settings(key, value)
+        VALUES('jackpot', ?)
         """,
         (JACKPOT_START,)
     )
 
     conn.commit()
+
+
+# =========================================================
+# АВТОМАТИЧЕСКАЯ ПРОВЕРКА СТАРОЙ БАЗЫ
+# =========================================================
+
+def ensure_column(table_name, column_name, column_type):
+    with db_lock:
+
+        columns = conn.execute(
+            f"PRAGMA table_info({table_name})"
+        ).fetchall()
+
+        existing = {
+            row["name"]
+            for row in columns
+        }
+
+        if column_name not in existing:
+
+            conn.execute(
+                f"""
+                ALTER TABLE {table_name}
+                ADD COLUMN {column_name} {column_type}
+                """
+            )
+
+            conn.commit()
+
+
+# На случай если старая версия базы уже существует
+ensure_column("users", "username", "TEXT DEFAULT ''")
+ensure_column("users", "first_name", "TEXT DEFAULT ''")
+ensure_column("users", "balance", "INTEGER NOT NULL DEFAULT 1000")
+ensure_column("users", "xp", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "level", "INTEGER NOT NULL DEFAULT 1")
+ensure_column("users", "last_bonus", "TEXT DEFAULT ''")
+ensure_column("users", "bonus_streak", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "spins", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "wins", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "total_won", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "best_win", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "current_streak", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "best_streak", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("users", "created_at", "TEXT DEFAULT ''")
 
 
 # =========================================================
@@ -235,7 +257,7 @@ def get_user(
                     username or "",
                     first_name or "",
                     START_BALANCE,
-                    now_utc().isoformat(),
+                    now_utc().isoformat()
                 )
             )
 
@@ -262,10 +284,7 @@ def get_user(
                     SET username=?
                     WHERE user_id=?
                     """,
-                    (
-                        username,
-                        user_id
-                    )
+                    (username, user_id)
                 )
 
                 changed = True
@@ -278,15 +297,13 @@ def get_user(
                     SET first_name=?
                     WHERE user_id=?
                     """,
-                    (
-                        first_name,
-                        user_id
-                    )
+                    (first_name, user_id)
                 )
 
                 changed = True
 
             if changed:
+
                 conn.commit()
 
                 row = conn.execute(
@@ -301,10 +318,7 @@ def get_user(
         return dict(row)
 
 
-def update_user(
-    user_id,
-    **fields
-):
+def update_user(user_id, **fields):
 
     allowed = {
         "username",
@@ -319,7 +333,7 @@ def update_user(
         "total_won",
         "best_win",
         "current_streak",
-        "best_streak",
+        "best_streak"
     }
 
     fields = {
@@ -353,10 +367,11 @@ def update_user(
         conn.commit()
 
 
-def register_chat_member(
-    chat_id,
-    user_id
-):
+# =========================================================
+# ЧАТЫ
+# =========================================================
+
+def register_chat_member(chat_id, user_id):
 
     if chat_id is None:
         return
@@ -369,10 +384,7 @@ def register_chat_member(
                 chat_id,
                 user_id
             )
-            VALUES(
-                ?,
-                ?
-            )
+            VALUES(?, ?)
             """,
             (
                 chat_id,
@@ -382,6 +394,10 @@ def register_chat_member(
 
         conn.commit()
 
+
+# =========================================================
+# ИМЯ
+# =========================================================
 
 def display_name(user):
 
@@ -394,7 +410,11 @@ def display_name(user):
     return "Игрок " + str(user["user_id"])[-4:]
 
 
-def user_from_message(message):
+# =========================================================
+# ПОЛУЧЕНИЕ USER ИЗ MESSAGE
+# =========================================================
+
+def user_from_message(message: Message):
 
     user = get_user(
         message.from_user.id,
@@ -410,7 +430,11 @@ def user_from_message(message):
     return user
 
 
-def user_from_callback(callback):
+# =========================================================
+# ПОЛУЧЕНИЕ USER ИЗ CALLBACK
+# =========================================================
+
+def user_from_callback(callback: CallbackQuery):
 
     user = get_user(
         callback.from_user.id,
@@ -419,6 +443,7 @@ def user_from_callback(callback):
     )
 
     if callback.message:
+
         register_chat_member(
             callback.message.chat.id,
             callback.from_user.id
@@ -428,14 +453,16 @@ def user_from_callback(callback):
 
 
 # =========================================================
-# УРОВНИ
+# УРОВЕНЬ
 # =========================================================
 
 def level_from_xp(xp):
+
     return xp // 100 + 1
 
 
 def xp_progress(xp):
+
     return xp % 100
 
 
@@ -455,6 +482,20 @@ def get_jackpot():
             """
         ).fetchone()
 
+        if row is None:
+
+            conn.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('jackpot', ?)
+                """,
+                (JACKPOT_START,)
+            )
+
+            conn.commit()
+
+            return JACKPOT_START
+
         return int(row["value"])
 
 
@@ -468,9 +509,7 @@ def set_jackpot(value):
             SET value=?
             WHERE key='jackpot'
             """,
-            (
-                max(0, int(value)),
-            )
+            (max(0, int(value)),)
         )
 
         conn.commit()
@@ -544,29 +583,6 @@ ACHIEVEMENTS = {
 }
 
 
-def has_achievement(
-    user_id,
-    achievement_id
-):
-
-    with db_lock:
-
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM achievements
-            WHERE user_id=?
-            AND achievement_id=?
-            """,
-            (
-                user_id,
-                achievement_id
-            )
-        ).fetchone()
-
-        return row is not None
-
-
 def unlock_achievement(
     user_id,
     achievement_id
@@ -584,11 +600,7 @@ def unlock_achievement(
                 achievement_id,
                 unlocked_at
             )
-            VALUES(
-                ?,
-                ?,
-                ?
-            )
+            VALUES(?, ?, ?)
             """,
             (
                 user_id,
@@ -600,6 +612,25 @@ def unlock_achievement(
         conn.commit()
 
         return cursor.rowcount > 0
+
+
+def get_achievement_ids(user_id):
+
+    with db_lock:
+
+        rows = conn.execute(
+            """
+            SELECT achievement_id
+            FROM achievements
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchall()
+
+    return [
+        row["achievement_id"]
+        for row in rows
+    ]
 
 
 def check_achievements(
@@ -642,10 +673,12 @@ def check_achievements(
         if achievement_id not in ACHIEVEMENTS:
             continue
 
-        if unlock_achievement(
+        unlocked = unlock_achievement(
             user_id,
             achievement_id
-        ):
+        )
+
+        if unlocked:
 
             reward = ACHIEVEMENTS[
                 achievement_id
@@ -658,45 +691,19 @@ def check_achievements(
                 balance=current["balance"] + reward
             )
 
-            title = ACHIEVEMENTS[
-                achievement_id
-            ][0]
-
             messages.append(
-                f"{title} — +{reward} 🪙"
+                f"{ACHIEVEMENTS[achievement_id][0]} "
+                f"— +{reward} 🪙"
             )
 
     return messages
-
-
-def get_achievement_ids(
-    user_id
-):
-
-    with db_lock:
-
-        rows = conn.execute(
-            """
-            SELECT achievement_id
-            FROM achievements
-            WHERE user_id=?
-            """,
-            (user_id,)
-        ).fetchall()
-
-    return [
-        row["achievement_id"]
-        for row in rows
-    ]
 
 
 # =========================================================
 # ЕЖЕДНЕВНЫЕ ЗАДАНИЯ
 # =========================================================
 
-def get_daily_task(
-    user_id
-):
+def get_daily_task(user_id):
 
     current_day = today()
 
@@ -708,10 +715,7 @@ def get_daily_task(
                 user_id,
                 task_date
             )
-            VALUES(
-                ?,
-                ?
-            )
+            VALUES(?, ?)
             """,
             (
                 user_id,
@@ -754,10 +758,7 @@ def update_daily_task(
                 user_id,
                 task_date
             )
-            VALUES(
-                ?,
-                ?
-            )
+            VALUES(?, ?)
             """,
             (
                 user_id,
@@ -787,22 +788,22 @@ def update_daily_task(
         conn.commit()
 
 
-def claim_daily_task_rewards(
-    user_id
-):
+def claim_daily_task_rewards(user_id):
 
     task = get_daily_task(user_id)
 
     reward = 0
 
-    if (
-        task["spins"] >= 10
-        and task["spins_claimed"] == 0
-    ):
+    current_day = today()
 
-        reward += 100
+    with db_lock:
 
-        with db_lock:
+        if (
+            task["spins"] >= 10
+            and task["spins_claimed"] == 0
+        ):
+
+            reward += 100
 
             conn.execute(
                 """
@@ -813,20 +814,16 @@ def claim_daily_task_rewards(
                 """,
                 (
                     user_id,
-                    today()
+                    current_day
                 )
             )
 
-            conn.commit()
+        if (
+            task["won"] >= 500
+            and task["won_claimed"] == 0
+        ):
 
-    if (
-        task["won"] >= 500
-        and task["won_claimed"] == 0
-    ):
-
-        reward += 200
-
-        with db_lock:
+            reward += 200
 
             conn.execute(
                 """
@@ -837,20 +834,16 @@ def claim_daily_task_rewards(
                 """,
                 (
                     user_id,
-                    today()
+                    current_day
                 )
             )
 
-            conn.commit()
+        if (
+            task["big_win"] >= 1
+            and task["big_win_claimed"] == 0
+        ):
 
-    if (
-        task["big_win"] >= 1
-        and task["big_win_claimed"] == 0
-    ):
-
-        reward += 500
-
-        with db_lock:
+            reward += 500
 
             conn.execute(
                 """
@@ -861,11 +854,11 @@ def claim_daily_task_rewards(
                 """,
                 (
                     user_id,
-                    today()
+                    current_day
                 )
             )
 
-            conn.commit()
+        conn.commit()
 
     if reward:
 
@@ -879,9 +872,7 @@ def claim_daily_task_rewards(
     return reward
 
 
-def tasks_text(
-    user_id
-):
+def tasks_text(user_id):
 
     task = get_daily_task(user_id)
 
@@ -938,7 +929,7 @@ def tasks_text(
 
 
 # =========================================================
-# КНОПКИ
+# КЛАВИАТУРЫ
 # =========================================================
 
 def main_keyboard():
@@ -966,65 +957,4 @@ def main_keyboard():
 
             [
                 InlineKeyboardButton(
-                    text="💰 Ставка 50",
-                    callback_data="spin:50"
-                ),
-                InlineKeyboardButton(
-                    text="💰 Ставка 100",
-                    callback_data="spin:100"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🎁 Бонус",
-                    callback_data="bonus"
-                ),
-                InlineKeyboardButton(
-                    text="🏆 Рейтинг",
-                    callback_data="top"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="📊 Профиль",
-                    callback_data="profile"
-                ),
-                InlineKeyboardButton(
-                    text="🎯 Задания",
-                    callback_data="tasks"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🏅 Достижения",
-                    callback_data="achievements"
-                ),
-                InlineKeyboardButton(
-                    text="💎 Джекпот",
-                    callback_data="jackpot"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="💰 Баланс",
-                    callback_data="balance"
-                )
-            ],
-        ]
-    )
-
-
-def top_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text="💰 Баланс",
-                    callback_data="top:balance"
-   
+                    text="💰 Став
