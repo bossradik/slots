@@ -1,6 +1,10 @@
-import os, random, sqlite3, threading, asyncio
+import os
+import random
+import sqlite3
+import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -11,925 +15,639 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 TOKEN = os.getenv("BOT_TOKEN")
 DB = "slots.db"
 
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(
+    TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
-con = sqlite3.connect(DB, check_same_thread=False)
-con.row_factory = sqlite3.Row
 lock = threading.Lock()
-
-SYM = ["🍒", "🍋", "🍊", "🔔", "💎", "7️⃣"]
-MUL = {"🍒": 5, "🍋": 7, "🍊": 10, "🔔": 15, "💎": 30, "7️⃣": 100}
-BETS = [10, 25, 50, 100]
+conn = sqlite3.connect(DB, check_same_thread=False)
+conn.row_factory = sqlite3.Row
 
 
-def q(sql, p=(), many=False):
+def db(q, p=(), one=False):
     with lock:
-        c = con.cursor()
-        c.execute(sql, p)
-        r = c.fetchall() if many else c.fetchone()
-        con.commit()
-        return r
+        cur = conn.execute(q, p)
+        conn.commit()
+        return cur.fetchone() if one else cur.fetchall()
 
 
 def init():
-    q("""CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY,
-    username TEXT,
-    name TEXT,
-    balance INTEGER DEFAULT 1000,
-    xp INTEGER DEFAULT 0,
-    level INTEGER DEFAULT 1,
-    spins INTEGER DEFAULT 0,
-    wins INTEGER DEFAULT 0,
-    best_win INTEGER DEFAULT 0,
-    last_bonus TEXT,
-    wheel TEXT,
-    bet INTEGER DEFAULT 10,
-    mission_day TEXT,
-    m1 INTEGER DEFAULT 0,
-    m2 INTEGER DEFAULT 0,
-    m3 INTEGER DEFAULT 0,
-    season TEXT,
-    season_points INTEGER DEFAULT 0,
-    claimed1 INTEGER DEFAULT 0,
-    claimed2 INTEGER DEFAULT 0,
-    claimed3 INTEGER DEFAULT 0
-    )""")
-
-    q("""CREATE TABLE IF NOT EXISTS chats(
-    id INTEGER PRIMARY KEY,
-    title TEXT,
-    spins INTEGER DEFAULT 0,
-    wins INTEGER DEFAULT 0,
-    coins INTEGER DEFAULT 0
-    )""")
-
-    have = {x["name"] for x in q("PRAGMA table_info(users)", many=True)}
-
-    cols = {
-        "wheel": "TEXT",
-        "bet": "INTEGER DEFAULT 10",
-        "mission_day": "TEXT",
-        "m1": "INTEGER DEFAULT 0",
-        "m2": "INTEGER DEFAULT 0",
-        "m3": "INTEGER DEFAULT 0",
-        "season": "TEXT",
-        "season_points": "INTEGER DEFAULT 0",
-        "claimed1": "INTEGER DEFAULT 0",
-        "claimed2": "INTEGER DEFAULT 0",
-        "claimed3": "INTEGER DEFAULT 0"
-    }
-
-    for name, typ in cols.items():
-        if name not in have:
-            q(f"ALTER TABLE users ADD COLUMN {name} {typ}")
+    db("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        name TEXT,
+        coins INTEGER DEFAULT 1000,
+        xp INTEGER DEFAULT 0,
+        spins INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        best INTEGER DEFAULT 0,
+        bet INTEGER DEFAULT 10,
+        mission_spins INTEGER DEFAULT 0,
+        mission_wins INTEGER DEFAULT 0,
+        mission_coins INTEGER DEFAULT 0,
+        wheel_day TEXT DEFAULT '',
+        mission_day TEXT DEFAULT '',
+        season INTEGER DEFAULT 0
+    )
+    """)
+    db("""
+    CREATE TABLE IF NOT EXISTS chats(
+        chat_id INTEGER PRIMARY KEY,
+        spins INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        coins INTEGER DEFAULT 0
+    )
+    """)
+    db("""
+    CREATE TABLE IF NOT EXISTS chat_users(
+        chat_id INTEGER,
+        user_id INTEGER,
+        PRIMARY KEY(chat_id,user_id)
+    )
+    """)
+    db("""
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value INTEGER
+    )
+    """)
+    if not db("SELECT * FROM settings WHERE key='jackpot'", one=True):
+        db("INSERT INTO settings VALUES('jackpot',5000)")
 
 
-def U(u):
-    r = q("SELECT * FROM users WHERE id=?", (u.id,))
-
-    if not r:
-        q(
+def user(m):
+    u = db("SELECT * FROM users WHERE id=?", (m.from_user.id,), True)
+    if not u:
+        db(
             "INSERT INTO users(id,username,name) VALUES(?,?,?)",
-            (u.id, u.username or "", u.full_name)
+            (m.from_user.id, m.from_user.username or "",
+             m.from_user.full_name[:40])
         )
-        r = q("SELECT * FROM users WHERE id=?", (u.id,))
     else:
-        q(
+        db(
             "UPDATE users SET username=?,name=? WHERE id=?",
-            (u.username or "", u.full_name, u.id)
+            (m.from_user.username or "", m.from_user.full_name[:40],
+             m.from_user.id)
         )
 
-    return r
-
-
-def C(m):
     if m.chat.type != "private":
-        q(
-            """INSERT INTO chats(id,title)
-            VALUES(?,?)
-            ON CONFLICT(id) DO UPDATE SET title=excluded.title""",
-            (m.chat.id, m.chat.title or "")
+        db(
+            "INSERT OR IGNORE INTO chat_users VALUES(?,?)",
+            (m.chat.id, m.from_user.id)
         )
+        db("INSERT OR IGNORE INTO chats(chat_id) VALUES(?)", (m.chat.id,))
+
+    return db("SELECT * FROM users WHERE id=?", (m.from_user.id,), True)
 
 
-def season():
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+def level(xp):
+    return xp // 100 + 1
 
 
-def sync(uid):
-    r = q("SELECT season FROM users WHERE id=?", (uid,))
-
-    if not r or r["season"] != season():
-        q(
-            "UPDATE users SET season=?,season_points=0 WHERE id=?",
-            (season(), uid)
-        )
-
-
-def add_xp(uid, n):
-    sync(uid)
-
-    r = q("SELECT xp FROM users WHERE id=?", (uid,))
-    new_xp = r["xp"] + n
-    level = new_xp // 100 + 1
-
-    q(
-        """UPDATE users
-        SET xp=?,level=?,season_points=season_points+?
-        WHERE id=?""",
-        (new_xp, level, n, uid)
-    )
-
-
-def menu():
-    k = InlineKeyboardBuilder()
-
-    buttons = [
-        ("🎰 Играть", "play"),
-        ("📖 Комбинации", "comb"),
-        ("🎡 Колесо", "wheel"),
-        ("🎯 Миссии", "missions"),
-        ("🏆 Топ", "top"),
-        ("🌍 Сезон", "season"),
-        ("🎲 Кости", "dice"),
-        ("⚔️ Дуэли", "duels"),
-        ("🏅 Достижения", "ach")
-    ]
-
-    for text, data in buttons:
-        k.button(text=text, callback_data=data)
-
-    k.adjust(2, 2, 2, 2, 1)
-    return k.as_markup()
-
-
-def game(uid):
-    r = q(
-        "SELECT balance,level,bet FROM users WHERE id=?",
-        (uid,)
-    )
-
-    k = InlineKeyboardBuilder()
-
-    k.button(
-        text=f"🎰 КРУТИТЬ — 💰{r['bet']}",
-        callback_data="spin"
-    )
-
-    for b in BETS:
-        k.button(
-            text=f"Ставка {b}",
-            callback_data=f"bet:{b}"
-        )
-
-    k.button(text="⬅️ Меню", callback_data="menu")
-    k.adjust(1, 4, 1)
-
-    text = (
-        "🎰 <b>СЛОТЫ</b>\n\n"
-        f"💰 Баланс: <b>{r['balance']}</b>\n"
-        f"⭐ Уровень: <b>{r['level']}</b>\n"
-        f"🎯 Ставка: <b>{r['bet']}</b>"
-    )
-
-    return text, k.as_markup()
-
-
-def combos():
-    return """📖 <b>КОМБИНАЦИИ</b>
-
-🍒🍒🍒 — x5
-🍋🍋🍋 — x7
-🍊🍊🍊 — x10
-🔔🔔🔔 — x15
-💎💎💎 — x30
-7️⃣7️⃣7️⃣ — x100
-
-Любые 2 одинаковых — x2
-
-👑💎7️⃣
-МИФИЧЕСКИЙ ДРОП
-+50 000💰"""
-
-
-def missions(uid):
-    r = q("SELECT * FROM users WHERE id=?", (uid,))
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    if r["mission_day"] != today:
-        q(
-            """UPDATE users
-            SET mission_day=?,m1=0,m2=0,m3=0,
-            claimed1=0,claimed2=0,claimed3=0
-            WHERE id=?""",
-            (today, uid)
-        )
-        r = q("SELECT * FROM users WHERE id=?", (uid,))
-
-    k = InlineKeyboardBuilder()
-    k.button(
-        text="🎁 Забрать награды",
-        callback_data="claim"
-    )
-    k.button(text="⬅️ Меню", callback_data="menu")
-    k.adjust(1)
-
-    text = (
-        "🎯 <b>МИССИИ ДНЯ</b>\n\n"
-        f"🎰 10 игр: {min(r['m1'],10)}/10 "
-        f"{'✅' if r['claimed1'] else ''}\n"
-        f"🏆 3 победы: {min(r['m2'],3)}/3 "
-        f"{'✅' if r['claimed2'] else ''}\n"
-        f"💰 1000 выигранных: {min(r['m3'],1000)}/1000 "
-        f"{'✅' if r['claimed3'] else ''}\n\n"
-        "🎁 Каждая награда: 250💰"
-    )
-
-    return text, k.as_markup()
-
-
-def topmenu():
-    k = InlineKeyboardBuilder()
-
-    buttons = [
-        ("💰 Монеты", "top:money"),
-        ("🎰 Игры", "top:spins"),
-        ("🏆 Победы", "top:wins"),
-        ("💎 Лучший", "top:best"),
-        ("👥 Группа", "top:group"),
-        ("⬅️ Меню", "menu")
-    ]
-
-    for text, data in buttons:
-        k.button(text=text, callback_data=data)
-
-    k.adjust(2, 2, 1, 1)
-    return k.as_markup()
-
-
-def toptext(mode):
-    columns = {
-        "money": "balance",
-        "spins": "spins",
-        "wins": "wins",
-        "best": "best_win"
-    }
-
-    titles = {
-        "money": "💰 МОНЕТЫ",
-        "spins": "🎰 ИГРЫ",
-        "wins": "🏆 ПОБЕДЫ",
-        "best": "💎 ЛУЧШИЙ ВЫИГРЫШ"
-    }
-
-    col = columns[mode]
-
-    rows = q(
-        f"SELECT * FROM users ORDER BY {col} DESC LIMIT 10",
-        many=True
-    )
-
-    text = f"<b>{titles[mode]}</b>\n\n"
-
-    for i, r in enumerate(rows, 1):
-        name = "@" + r["username"] if r["username"] else r["name"]
-        text += f"{i}. {name} — <b>{r[col]}</b>\n"
-
-    return text
+def day():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def happy():
-    return datetime.now(timezone.utc).hour in (18, 19)
+    h = datetime.now(timezone.utc).hour
+    return 18 <= h < 20
 
 
-async def spin(uid):
-    r = q(
-        "SELECT balance,bet FROM users WHERE id=?",
-        (uid,)
+def game_kb(u):
+    b = InlineKeyboardBuilder()
+    b.button(text="🎰 КРУТИТЬ", callback_data="spin")
+    b.button(text=f"💰 Ставка: {u['bet']}", callback_data="bets")
+    b.button(text="📖 Комбинации", callback_data="combos")
+    b.button(text="🎡 Колесо", callback_data="wheel")
+    b.button(text="🎯 Задания", callback_data="missions")
+    b.adjust(1, 1, 2)
+    return b.as_markup()
+
+
+def bets_kb():
+    b = InlineKeyboardBuilder()
+    for x in (10, 25, 50, 100):
+        b.button(text=f"💰 {x}", callback_data=f"bet:{x}")
+    b.button(text="⬅️ Назад", callback_data="back")
+    b.adjust(2, 2, 1)
+    return b.as_markup()
+
+
+async def game(m):
+    u = user(m)
+    j = db("SELECT value FROM settings WHERE key='jackpot'", one=True)["value"]
+    text = (
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        f"💰 Баланс: <b>{u['coins']}</b>\n"
+        f"⭐ Уровень: <b>{level(u['xp'])}</b>\n"
+        f"✨ XP: <b>{u['xp']}</b>\n"
+        f"💵 Ставка: <b>{u['bet']}</b>\n"
+        f"👑 Джекпот: <b>{j}</b>\n\n"
+        "Нажми <b>КРУТИТЬ</b> 🎰"
     )
-
-    bet = r["bet"]
-
-    if r["balance"] < bet:
-        return "❌ Недостаточно монет."
-
-    a = [
-        random.choice(SYM),
-        random.choice(SYM),
-        random.choice(SYM)
-    ]
-
-    win = 0
-    rare = False
-
-    if random.randint(1, 10000) == 1:
-        a = ["👑", "💎", "7️⃣"]
-        win = 50000
-        rare = True
-
-    elif a[0] == a[1] == a[2]:
-        win = bet * MUL[a[0]]
-
-    elif (
-        a[0] == a[1]
-        or a[0] == a[2]
-        or a[1] == a[2]
-    ):
-        win = bet * 2
-
-    if win and happy():
-        win *= 2
-
-    q(
-        """UPDATE users
-        SET balance=balance-?+?,
-        spins=spins+1,
-        wins=wins+?,
-        best_win=MAX(best_win,?),
-        m1=m1+1,
-        m2=m2+?,
-        m3=m3+?
-        WHERE id=?""",
-        (
-            bet,
-            win,
-            int(win > 0),
-            win,
-            int(win > 0),
-            win,
-            uid
-        )
-    )
-
-    add_xp(uid, 500 if rare else 10)
-
-    if rare:
-        return (
-            "👑 <b>МИФИЧЕСКИЙ ДРОП!</b>\n\n"
-            f"{''.join(a)}\n\n"
-            f"💰 <b>+{win}</b>"
-        )
-
-    if win:
-        extra = "\n🔥 HAPPY HOUR x2!" if happy() else ""
-
-        return (
-            f"{' | '.join(a)}\n\n"
-            f"🎉 Выигрыш: <b>+{win}</b>"
-            f"{extra}"
-        )
-
-    return (
-        f"{' | '.join(a)}\n\n"
-        f"💸 Проигрыш: <b>-{bet}</b>"
-    )
+    await m.answer(text, reply_markup=game_kb(u))
 
 
 @dp.message(CommandStart())
 async def start(m: Message):
-    U(m.from_user)
-    C(m)
-
+    user(m)
     await m.answer(
         "🎰 <b>Добро пожаловать в СЛОТЫ!</b>\n\n"
-        "Крути, выполняй миссии и поднимайся в рейтинге.",
-        reply_markup=menu()
-    )
-
-
-@dp.message(Command("help"))
-async def help_cmd(m: Message):
-    await m.answer(
-        "<b>📚 КОМАНДЫ</b>\n\n"
-        "/start — меню\n"
-        "/slots — играть\n"
-        "/balance — баланс\n"
-        "/bonus — ежедневный бонус\n"
-        "/top — рейтинг\n"
-        "/group — статистика группы\n"
-        "/pay 500 — перевод ответом\n"
-        "/pay @username 500 — перевод\n"
-        "/duel @username 100 — дуэль\n\n"
-        "Все основные функции также есть в меню 👇",
-        reply_markup=menu()
+        "Крути барабаны, выполняй задания, "
+        "соревнуйся с игроками и собирай монеты.\n\n"
+        "Нажми /slots",
     )
 
 
 @dp.message(Command("slots"))
 async def slots(m: Message):
-    U(m.from_user)
+    await game(m)
 
-    text, keyboard = game(m.from_user.id)
 
+@dp.message(Command("help"))
+async def help_cmd(m: Message):
+    user(m)
     await m.answer(
-        text,
-        reply_markup=keyboard
+        "📚 <b>КОМАНДЫ</b>\n\n"
+        "/slots — 🎰 играть\n"
+        "/balance — 💰 баланс\n"
+        "/bonus — 🎁 ежедневный бонус\n"
+        "/top — 🏆 общий топ\n"
+        "/group — 👥 статистика группы\n"
+        "/pay — 💸 передать монеты\n"
+        "/duel — ⚔️ дуэль\n"
+        "/dice — 🎲 кости\n"
+        "/help — 📚 команды"
     )
 
 
 @dp.message(Command("balance"))
 async def balance(m: Message):
-    r = U(m.from_user)
-
+    u = user(m)
     await m.answer(
-        f"💰 Баланс: <b>{r['balance']}</b>\n"
-        f"⭐ Уровень: <b>{r['level']}</b>\n"
-        f"✨ XP: <b>{r['xp']}</b>"
+        f"💰 Баланс: <b>{u['coins']}</b>\n"
+        f"⭐ Уровень: <b>{level(u['xp'])}</b>\n"
+        f"✨ XP: <b>{u['xp']}</b>\n"
+        f"🎰 Игр: <b>{u['spins']}</b>\n"
+        f"🏆 Побед: <b>{u['wins']}</b>\n"
+        f"💎 Лучший выигрыш: <b>{u['best']}</b>"
     )
 
 
 @dp.message(Command("bonus"))
 async def bonus(m: Message):
-    r = U(m.from_user)
+    u = user(m)
+    d = day()
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    if r["last_bonus"] == today:
-        await m.answer("⏳ Ежедневный бонус уже получен.")
+    if u["mission_day"] == d:
+        await m.answer("🎁 Сегодняшний бонус уже получен.")
         return
 
-    reward = 100 + r["level"] * 25
+    amount = 100 + level(u["xp"]) * 25
+    db(
+        "UPDATE users SET coins=coins+?,mission_day=? WHERE id=?",
+        (amount, d, u["id"])
+    )
+    await m.answer(f"🎁 Бонус получен: <b>+{amount}</b> 💰")
 
-    q(
-        """UPDATE users
-        SET balance=balance+?,last_bonus=?
-        WHERE id=?""",
-        (reward, today, m.from_user.id)
+
+@dp.callback_query(F.data == "bets")
+async def bets(c: CallbackQuery):
+    await c.message.edit_text(
+        "💰 <b>ВЫБЕРИ СТАВКУ</b>\n\n"
+        "Ставка сохранится и будет использоваться "
+        "при следующем вращении.",
+        reply_markup=bets_kb()
+    )
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("bet:"))
+async def set_bet(c: CallbackQuery):
+    x = int(c.data.split(":")[1])
+    db("UPDATE users SET bet=? WHERE id=?", (x, c.from_user.id))
+    u = db("SELECT * FROM users WHERE id=?", (c.from_user.id,), True)
+    await c.message.edit_text(
+        f"💵 Ставка установлена: <b>{x}</b>\n\n"
+        "Можно сразу крутить 🎰",
+        reply_markup=game_kb(u)
+    )
+    await c.answer()
+
+
+@dp.callback_query(F.data == "spin")
+async def spin(c: CallbackQuery):
+    u = db("SELECT * FROM users WHERE id=?", (c.from_user.id,), True)
+
+    if not u or u["coins"] < u["bet"]:
+        await c.answer("❌ Недостаточно монет", show_alert=True)
+        return
+
+    bet = u["bet"]
+
+    await c.message.edit_text("🎰 <b>7️⃣ | 🍒 | 🔔</b>\n\nКрутим...")
+    await c.answer()
+
+    symbols = ["🍒", "🍋", "🍊", "🔔", "💎", "7️⃣"]
+    a, b, d = random.choices(symbols, k=3)
+
+    jackpot = db(
+        "SELECT value FROM settings WHERE key='jackpot'",
+        one=True
+    )["value"]
+
+    win = 0
+    reason = ""
+
+    if random.randint(1, 10000) == 1:
+        win = 50000
+        reason = "👑 <b>ЛЕГЕНДАРНЫЙ ДРОП!</b>"
+    elif a == b == d == "7️⃣":
+        win = jackpot
+        db("UPDATE settings SET value=5000 WHERE key='jackpot'")
+        reason = "👑 <b>ДЖЕКПОТ!</b>"
+    elif a == b == d:
+        mult = {
+            "🍒": 5,
+            "🍋": 7,
+            "🍊": 10,
+            "🔔": 15,
+            "💎": 30,
+            "7️⃣": 100
+        }[a]
+        win = bet * mult
+        reason = f"🔥 Тройка! x{mult}"
+    elif a == b or a == d or b == d:
+        win = bet * 2
+        reason = "✨ Два одинаковых! x2"
+
+    if happy() and win:
+        win *= 2
+        reason += "\n🔥 <b>HAPPY HOUR x2!</b>"
+
+    newcoins = u["coins"] - bet + win
+    xp = u["xp"] + 10
+    best = max(u["best"], win)
+
+    db("""
+    UPDATE users SET
+    coins=?,xp=?,spins=spins+1,wins=wins+?,best=?,
+    mission_spins=mission_spins+1,
+    mission_wins=mission_wins+?,
+    mission_coins=mission_coins+?,
+    season=season+?
+    WHERE id=?
+    """, (
+        newcoins, xp, 1 if win else 0, best,
+        1 if win else 0, win, win, u["id"]
+    ))
+
+    db(
+        "UPDATE settings SET value=value+? WHERE key='jackpot'",
+        (max(1, bet // 10),)
     )
 
-    await m.answer(
-        f"🎁 Бонус получен: <b>+{reward}💰</b>"
+    if c.message.chat.type != "private":
+        db(
+            "UPDATE chats SET spins=spins+1,wins=wins+?,coins=coins+? WHERE chat_id=?",
+            (1 if win else 0, win, c.message.chat.id)
+        )
+
+    text = (
+        f"🎰 <b>{a} | {b} | {d}</b>\n\n"
+        f"{reason or '💨 Не повезло...'}\n\n"
+        f"💰 Ставка: <b>{bet}</b>\n"
+        f"🏆 Выигрыш: <b>{win}</b>\n"
+        f"💰 Баланс: <b>{newcoins}</b>\n"
+        f"⭐ Уровень: <b>{level(xp)}</b>"
     )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎰 КРУТИТЬ ЕЩЁ РАЗ", callback_data="spin")
+    kb.button(text="💰 Изменить ставку", callback_data="bets")
+    kb.button(text="📖 Комбинации", callback_data="combos")
+    kb.adjust(1, 2)
+
+    await c.message.edit_text(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "combos")
+async def combos(c: CallbackQuery):
+    await c.message.edit_text(
+        "📖 <b>КОМБИНАЦИИ</b>\n\n"
+        "🍒🍒🍒 — x5\n"
+        "🍋🍋🍋 — x7\n"
+        "🍊🍊🍊 — x10\n"
+        "🔔🔔🔔 — x15\n"
+        "💎💎💎 — x30\n"
+        "7️⃣7️⃣7️⃣ — ДЖЕКПОТ 👑\n\n"
+        "✨ Любые 2 одинаковых — x2\n"
+        "👑 Редкий дроп — 50 000 💰\n"
+        "🔥 Happy Hour — удвоение выигрыша",
+        reply_markup=InlineKeyboardBuilder().button(
+            text="⬅️ Играть", callback_data="back"
+        ).as_markup()
+    )
+    await c.answer()
+
+
+@dp.callback_query(F.data == "back")
+async def back(c: CallbackQuery):
+    u = db("SELECT * FROM users WHERE id=?", (c.from_user.id,), True)
+    await c.message.edit_text(
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        f"💰 Баланс: <b>{u['coins']}</b>\n"
+        f"⭐ Уровень: <b>{level(u['xp'])}</b>\n"
+        f"💵 Ставка: <b>{u['bet']}</b>",
+        reply_markup=game_kb(u)
+    )
+    await c.answer()
+
+
+@dp.callback_query(F.data == "missions")
+async def missions(c: CallbackQuery):
+    u = db("SELECT * FROM users WHERE id=?", (c.from_user.id,), True)
+    text = (
+        "🎯 <b>ЗАДАНИЯ</b>\n\n"
+        f"🎰 10 вращений: {min(u['mission_spins'],10)}/10\n"
+        f"🏆 5 побед: {min(u['mission_wins'],5)}/5\n"
+        f"💰 Выиграть 1000: {min(u['mission_coins'],1000)}/1000\n\n"
+        "Награда: <b>500 💰</b>"
+    )
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🎁 Забрать", callback_data="claim_mission")
+    b.button(text="⬅️ Назад", callback_data="back")
+    b.adjust(1, 1)
+
+    await c.message.edit_text(text, reply_markup=b.as_markup())
+    await c.answer()
+
+
+@dp.callback_query(F.data == "claim_mission")
+async def claim_mission(c: CallbackQuery):
+    u = db("SELECT * FROM users WHERE id=?", (c.from_user.id,), True)
+
+    if (
+        u["mission_spins"] < 10
+        or u["mission_wins"] < 5
+        or u["mission_coins"] < 1000
+    ):
+        await c.answer("❌ Задание ещё не выполнено", show_alert=True)
+        return
+
+    db("""
+    UPDATE users SET coins=coins+500,
+    mission_spins=0,mission_wins=0,mission_coins=0
+    WHERE id=?
+    """, (u["id"],))
+
+    await c.answer("🎁 +500 монет!")
+    await missions(c)
+
+
+@dp.callback_query(F.data == "wheel")
+async def wheel(c: CallbackQuery):
+    u = db("SELECT * FROM users WHERE id=?", (c.from_user.id,), True)
+
+    if u["wheel_day"] == day():
+        await c.answer("🎡 Сегодня колесо уже использовано", show_alert=True)
+        return
+
+    prizes = [50, 100, 150, 250, 500, 1000, 2000]
+    prize = random.choice(prizes)
+
+    db(
+        "UPDATE users SET coins=coins+?,wheel_day=? WHERE id=?",
+        (prize, day(), u["id"])
+    )
+
+    await c.message.edit_text(
+        f"🎡 <b>КОЛЕСО</b>\n\n"
+        f"🎉 Тебе выпало: <b>+{prize} 💰</b>",
+        reply_markup=game_kb(
+            db("SELECT * FROM users WHERE id=?", (u["id"],), True)
+        )
+    )
+    await c.answer()
 
 
 @dp.message(Command("top"))
-async def top_cmd(m: Message):
-    await m.answer(
-        toptext("money"),
-        reply_markup=topmenu()
-    )
+async def top(m: Message):
+    user(m)
+    rows = db("""
+    SELECT name,coins,spins,wins,best
+    FROM users ORDER BY coins DESC LIMIT 10
+    """)
+
+    text = "🏆 <b>ТОП ЛУДИКОВ</b>\n\n"
+    for i, x in enumerate(rows, 1):
+        text += (
+            f"{i}. {x['name']} — 💰 {x['coins']} "
+            f"| 🎰 {x['spins']} | 🏆 {x['wins']}\n"
+        )
+
+    await m.answer(text)
 
 
 @dp.message(Command("group"))
-async def group_cmd(m: Message):
+async def group(m: Message):
     if m.chat.type == "private":
         await m.answer("👥 Эта команда работает в группе.")
         return
 
-    C(m)
+    user(m)
+    rows = db("""
+    SELECT u.name,u.coins,u.wins
+    FROM users u
+    JOIN chat_users c ON c.user_id=u.id
+    WHERE c.chat_id=?
+    ORDER BY u.coins DESC LIMIT 10
+    """, (m.chat.id,))
 
-    r = q(
-        "SELECT * FROM chats WHERE id=?",
-        (m.chat.id,)
+    st = db(
+        "SELECT * FROM chats WHERE chat_id=?",
+        (m.chat.id,), True
     )
 
-    await m.answer(
-        f"👥 <b>{r['title']}</b>\n\n"
-        f"🎰 Игр: <b>{r['spins']}</b>\n"
-        f"🏆 Побед: <b>{r['wins']}</b>\n"
-        f"💰 Выиграно: <b>{r['coins']}</b>"
+    text = (
+        "👥 <b>СТАТИСТИКА ГРУППЫ</b>\n\n"
+        f"🎰 Вращений: <b>{st['spins']}</b>\n"
+        f"🏆 Побед: <b>{st['wins']}</b>\n"
+        f"💰 Выиграно: <b>{st['coins']}</b>\n\n"
+        "🏆 <b>ТОП ГРУППЫ</b>\n"
     )
+
+    for i, x in enumerate(rows, 1):
+        text += f"{i}. {x['name']} — 💰 {x['coins']}\n"
+
+    await m.answer(text)
 
 
 @dp.message(Command("pay"))
 async def pay(m: Message):
-    U(m.from_user)
-
+    user(m)
     parts = m.text.split()
-    target = None
-    amount = 0
 
-    try:
-        if m.reply_to_message and len(parts) >= 2:
-            target = m.reply_to_message.from_user
-            amount = int(parts[1])
-
-        elif len(parts) >= 3:
-            username = parts[1].lstrip("@")
-            target = q(
-                "SELECT * FROM users WHERE username=?",
-                (username,)
-            )
-            amount = int(parts[2])
-
-    except ValueError:
-        pass
-
-    if not target or amount <= 0:
+    if len(parts) < 2:
         await m.answer(
-            "💰 Используй:\n"
-            "/pay 500 — ответом на сообщение"
+            "💸 Использование:\n"
+            "<code>/pay 500</code> — ответом на сообщение игрока"
         )
         return
 
-    tid = target.id if hasattr(target, "id") else target["id"]
-
-    if tid == m.from_user.id:
-        await m.answer("❌ Нельзя переводить самому себе.")
+    try:
+        amount = int(parts[-1])
+    except ValueError:
+        await m.answer("❌ Укажи сумму.")
         return
 
-    r = U(m.from_user)
+    if amount <= 0:
+        await m.answer("❌ Неверная сумма.")
+        return
 
-    if r["balance"] < amount:
+    target = None
+
+    if m.reply_to_message:
+        target = user(m.reply_to_message)
+
+    elif len(parts) >= 3 and parts[1].startswith("@"):
+        target = db(
+            "SELECT * FROM users WHERE username=?",
+            (parts[1][1:],), True
+        )
+
+    if not target:
+        await m.answer("❌ Игрок не найден. Лучше используй ответ на его сообщение.")
+        return
+
+    sender = db("SELECT * FROM users WHERE id=?", (m.from_user.id,), True)
+
+    if sender["coins"] < amount:
         await m.answer("❌ Недостаточно монет.")
         return
 
-    if hasattr(target, "id"):
-        U(target)
+    if target["id"] == sender["id"]:
+        await m.answer("❌ Нельзя отправить монеты самому себе.")
+        return
 
-    q(
-        "UPDATE users SET balance=balance-? WHERE id=?",
-        (amount, m.from_user.id)
+    db(
+        "UPDATE users SET coins=coins-? WHERE id=?",
+        (amount, sender["id"])
     )
-
-    q(
-        "UPDATE users SET balance=balance+? WHERE id=?",
-        (amount, tid)
+    db(
+        "UPDATE users SET coins=coins+? WHERE id=?",
+        (amount, target["id"])
     )
 
     await m.answer(
-        f"💰 Перевод выполнен: <b>{amount}</b>"
+        f"💸 Передано <b>{amount}</b> 💰 игроку "
+        f"<b>{target['name']}</b>"
     )
+
+
+@dp.message(Command("dice"))
+async def dice(m: Message):
+    u = user(m)
+
+    if u["coins"] < 50:
+        await m.answer("❌ Нужно минимум 50 💰.")
+        return
+
+    roll = random.randint(1, 6)
+
+    if roll >= 4:
+        win = 100
+        db("UPDATE users SET coins=coins+50 WHERE id=?", (u["id"],))
+        result = f"🎉 Победа! Выпало <b>{roll}</b>. +50 💰"
+    else:
+        db("UPDATE users SET coins=coins-50 WHERE id=?", (u["id"],))
+        result = f"💨 Проигрыш. Выпало <b>{roll}</b>. -50 💰"
+
+    await m.answer("🎲 <b>КОСТИ</b>\n\n" + result)
 
 
 @dp.message(Command("duel"))
 async def duel(m: Message):
+    user(m)
+
+    if not m.reply_to_message:
+        await m.answer(
+            "⚔️ Для дуэли ответь на сообщение игрока:\n"
+            "<code>/duel 100</code>"
+        )
+        return
+
     parts = m.text.split()
-    target = None
-    amount = 100
 
     try:
-        if m.reply_to_message and len(parts) >= 2:
-            target = m.reply_to_message.from_user
-            amount = int(parts[1])
-
-        elif len(parts) >= 3:
-            username = parts[1].lstrip("@")
-            target = q(
-                "SELECT * FROM users WHERE username=?",
-                (username,)
-            )
-            amount = int(parts[2])
-
+        amount = int(parts[1]) if len(parts) > 1 else 100
     except ValueError:
-        pass
+        amount = 100
 
-    if not target or amount <= 0:
+    if amount <= 0:
+        await m.answer("❌ Неверная ставка.")
+        return
+
+    a = db("SELECT * FROM users WHERE id=?", (m.from_user.id,), True)
+    b = user(m.reply_to_message)
+
+    if a["coins"] < amount or b["coins"] < amount:
+        await m.answer("❌ У одного из игроков недостаточно монет.")
+        return
+
+    ra = random.randint(1, 6)
+    rb = random.randint(1, 6)
+
+    if ra == rb:
         await m.answer(
-            "⚔️ Используй:\n"
-            "/duel @username 100"
+            f"⚔️ <b>НИЧЬЯ!</b>\n\n"
+            f"{a['name']}: 🎲 {ra}\n"
+            f"{b['name']}: 🎲 {rb}"
         )
         return
 
-    tid = target.id if hasattr(target, "id") else target["id"]
+    winner = a if ra > rb else b
+    loser = b if ra > rb else a
 
-    U(m.from_user)
-
-    if hasattr(target, "id"):
-        U(target)
-
-    if tid == m.from_user.id:
-        await m.answer("❌ Нельзя вызвать самого себя.")
-        return
-
-    a = q(
-        "SELECT balance FROM users WHERE id=?",
-        (m.from_user.id,)
-    )
-
-    b = q(
-        "SELECT balance FROM users WHERE id=?",
-        (tid,)
-    )
-
-    if a["balance"] < amount or b["balance"] < amount:
-        await m.answer(
-            "❌ У одного из игроков недостаточно монет."
-        )
-        return
-
-    x = random.randint(1, 6)
-    y = random.randint(1, 6)
-
-    q(
-        """UPDATE users
-        SET balance=balance-?
-        WHERE id IN (?,?)""",
-        (amount, m.from_user.id, tid)
-    )
-
-    winner = m.from_user.id if x >= y else tid
-
-    q(
-        """UPDATE users
-        SET balance=balance+?,
-        wins=wins+1
-        WHERE id=?""",
-        (amount * 2, winner)
-    )
-
-    add_xp(winner, 25)
+    db("UPDATE users SET coins=coins+? WHERE id=?", (amount, winner["id"]))
+    db("UPDATE users SET coins=coins-? WHERE id=?", (amount, loser["id"]))
 
     await m.answer(
         "⚔️ <b>ДУЭЛЬ</b>\n\n"
-        f"🎲 {x} против {y}\n\n"
-        f"🏆 Победитель получает "
-        f"<b>{amount * 2}💰</b>"
+        f"{a['name']}: 🎲 {ra}\n"
+        f"{b['name']}: 🎲 {rb}\n\n"
+        f"👑 Победитель: <b>{winner['name']}</b>\n"
+        f"💰 Приз: <b>{amount}</b>"
     )
 
 
-@dp.callback_query(F.data == "menu")
-async def cb_menu(c: CallbackQuery):
-    await c.answer()
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-    await c.message.edit_text(
-        "🎰 <b>Главное меню</b>",
-        reply_markup=menu()
-    )
+    def log_message(self, *args):
+        pass
 
 
-@dp.callback_query(F.data == "play")
-async def cb_play(c: CallbackQuery):
-    U(c.from_user)
+def server():
+    port = int(os.getenv("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-    text, keyboard = game(c.from_user.id)
 
-    await c.answer()
+async def main():
+    init()
+    threading.Thread(target=server, daemon=True).start()
+    await bot.delete_webhook(drop_pending_updates=False)
+    print("BOT STARTED")
+    await dp.start_polling(bot)
 
-    await c.message.edit_text(
-        text,
-        reply_markup=keyboard
-    )
 
-
-@dp.callback_query(F.data.startswith("bet:"))
-async def cb_bet(c: CallbackQuery):
-    bet = int(c.data.split(":")[1])
-
-    q(
-        "UPDATE users SET bet=? WHERE id=?",
-        (bet, c.from_user.id)
-    )
-
-    text, keyboard = game(c.from_user.id)
-
-    await c.answer(
-        f"Ставка установлена: {bet}💰"
-    )
-
-    await c.message.edit_text(
-        text,
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(F.data == "spin")
-async def cb_spin(c: CallbackQuery):
-    U(c.from_user)
-
-    await c.answer("🎰 Крутим!")
-
-    await c.message.edit_text(
-        "🎰 <b>ВРАЩЕНИЕ...</b>\n\n"
-        "❔ | ❔ | ❔"
-    )
-
-    await asyncio.sleep(0.35)
-
-    await c.message.edit_text(
-        "🎰 <b>ВРАЩЕНИЕ...</b>\n\n"
-        "🍒 | 🔔 | 💎"
-    )
-
-    await asyncio.sleep(0.35)
-
-    result = await spin(c.from_user.id)
-
-    text, keyboard = game(c.from_user.id)
-
-    await c.message.edit_text(
-        result + "\n\n" + text,
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(F.data == "comb")
-async def cb_comb(c: CallbackQuery):
-    k = InlineKeyboardBuilder()
-    k.button(
-        text="⬅️ Меню",
-        callback_data="menu"
-    )
-
-    await c.answer()
-
-    await c.message.edit_text(
-        combos(),
-        reply_markup=k.as_markup()
-    )
-
-
-@dp.callback_query(F.data == "missions")
-async def cb_missions(c: CallbackQuery):
-    text, keyboard = missions(c.from_user.id)
-
-    await c.answer()
-
-    await c.message.edit_text(
-        text,
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(F.data == "claim")
-async def cb_claim(c: CallbackQuery):
-    r = q(
-        "SELECT * FROM users WHERE id=?",
-        (c.from_user.id,)
-    )
-
-    reward = 0
-
-    missions_data = [
-        (1, 10, "m1"),
-        (2, 3, "m2"),
-        (3, 1000, "m3")
-    ]
-
-    for num, need, field in missions_data:
-        if r[field] >= need and not r[f"claimed{num}"]:
-            reward += 250
-
-            q(
-                f"UPDATE users SET claimed{num}=1 WHERE id=?",
-                (c.from_user.id,)
-            )
-
-    if reward:
-        q(
-            "UPDATE users SET balance=balance+? WHERE id=?",
-            (reward, c.from_user.id)
-        )
-
-        await c.answer(
-            f"🎁 Получено +{reward}💰"
-        )
-
-    else:
-        await c.answer(
-            "❌ Выполненных миссий пока нет.",
-            show_alert=True
-        )
-
-    text, keyboard = missions(c.from_user.id)
-
-    await c.message.edit_text(
-        text,
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(F.data == "wheel")
-async def cb_wheel(c: CallbackQuery):
-    r = U(c.from_user)
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    if r["wheel"] == today:
-        await c.answer(
-            "⏳ Колесо уже использовано сегодня.",
-            show_alert=True
-        )
-        return
-
-    reward = random.choice([
-        50, 100, 150, 250, 500, 1000, 2000
-    ])
-
-    q(
-        """UPDATE users
-        SET balance=balance+?,wheel=?
-        WHERE id=?""",
-        (reward, today, c.from_user.id)
-    )
-
-    await c.answer("🎡 Готово!")
-
-    await c.message.edit_text(
-        "🎡 <b>КОЛЕСО ФОРТУНЫ</b>\n\n"
-        f"🎉 Тебе выпало: <b>+{reward}💰</b>",
-        reply_markup=menu()
-    )
-
-
-@dp.callback_query(F.data == "top")
-async def cb_top(c: CallbackQuery):
-    await c.answer()
-
-    await c.message.edit_text(
-        toptext("money"),
-        reply_markup=topmenu()
-    )
-
-
-@dp.callback_query(F.data.startswith("top:"))
-async def cb_top_mode(c: CallbackQuery):
-    mode = c.data.split(":")[1]
-
-    await c.answer()
-
-    if mode == "group":
-        if c.message.chat.type == "private":
-            await c.message.edit_text(
-                "👥 Топ группы доступен в группе.",
-                reply_markup=topmenu()
-            )
-            return
-
-        rows = q(
-            "SELECT * FROM users ORDER BY balance DESC LIMIT 10",
-            many=True
-        )
-
-        text = "👥 <b>ТОП ИГРОКОВ</b>\n\n"
-
-        for i, r in enumerate(rows, 1):
-            name = (
-                "@" + r["username"]
-                if r["username"]
-                else r["name"]
-            )
-
-            text += (
-                f"{i}. {name} — "
-                f"{r['balance']}💰\n"
-            )
-
-    else:
-        text = toptext(mode)
-
-    await c.message.edit_text(
-        text,
-        reply_markup=topmenu()
-    )
-
-
-@dp.callback_query(F.data == "season")
-async def cb_season(c: CallbackQuery):
-    sync(c.from_user.id)
-
-    rows = q(
-        """SELECT * FROM users
-        WHERE season=?
-        ORDER BY season_points DESC
-        LIMIT 10""",
-        (season(),),
-        many=True
-    )
-
-    text = (
-        f"🌍 <b>СЕЗОН {season()}</b>\n\n"
-    )
-
-    for i, r in enumerate(rows, 1):
-        name = (
-            "@" + r["username"]
-            if r["username"]
-            else r["name"]
-        )
-
-        text += (
-            f"{i}. {name} — "
-            f"{r['season_points']} очков\n"
-        )
-
-    k = InlineKeyboardBuilder()
-    k.button(
-        text="⬅️ Меню",
-        callback_data="menu"
-    )
-
-    await c.answer()
-
-    await c.message.edit_text(
-        text,
-        reply_markup=k.as_markup()
-    )
-
-
-@dp.callback_query(F.data == "ach")
-async def cb_ach(c: CallbackQuery):
-    r = q(
-        "SELECT * FROM users WHERE id=?",
-        (c.from_user.id,)
-    )
-
-    achievements = [
-        (r["spins"] >= 10, "10 игр"),
-        (r["spins"] >= 100, "100 игр"),
-        (r["wins"] >= 10, "10 побед"),
-        (r["best_win"] >= 1000, "Выиграть 1000"),
-  
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
