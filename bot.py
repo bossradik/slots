@@ -37,6 +37,10 @@ MULTI = {
 BETS = [10, 25, 50, 100]
 
 
+# =========================
+# DATABASE
+# =========================
+
 def con():
     return sqlite3.connect(DB)
 
@@ -66,6 +70,17 @@ def init_db():
     )
     """)
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS duels(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        creator INTEGER,
+        opponent INTEGER DEFAULT 0,
+        bet INTEGER,
+        status TEXT DEFAULT 'waiting',
+        winner INTEGER DEFAULT 0
+    )
+    """)
+
     c.execute(
         "INSERT OR IGNORE INTO jackpot(id,money) VALUES(1,5000)"
     )
@@ -74,17 +89,17 @@ def init_db():
     c.close()
 
 
-def register(user):
+def register(u):
     c = con()
 
     c.execute(
         "INSERT OR IGNORE INTO users(id,name) VALUES(?,?)",
-        (user.id, user.full_name or "Игрок")
+        (u.id, u.full_name or "Игрок")
     )
 
     c.execute(
         "UPDATE users SET name=? WHERE id=?",
-        (user.full_name or "Игрок", user.id)
+        (u.full_name or "Игрок", u.id)
     )
 
     c.commit()
@@ -117,10 +132,12 @@ def update(uid, field, value):
         return
 
     c = con()
+
     c.execute(
         f"UPDATE users SET {field}=? WHERE id=?",
         (value, uid)
     )
+
     c.commit()
     c.close()
 
@@ -132,31 +149,42 @@ def level(uid):
 
 def get_jackpot():
     c = con()
+
     r = c.execute(
         "SELECT money FROM jackpot WHERE id=1"
     ).fetchone()
+
     c.close()
+
     return r[0]
 
 
 def add_jackpot(value):
     c = con()
+
     c.execute(
         "UPDATE jackpot SET money=money+? WHERE id=1",
         (value,)
     )
+
     c.commit()
     c.close()
 
 
 def reset_jackpot():
     c = con()
+
     c.execute(
         "UPDATE jackpot SET money=5000 WHERE id=1"
     )
+
     c.commit()
     c.close()
 
+
+# =========================
+# MENUS
+# =========================
 
 def menu():
     k = InlineKeyboardBuilder()
@@ -167,6 +195,7 @@ def menu():
         ("🎁 Бонус", "bonus"),
         ("🏆 Топ", "top"),
         ("🔢 Комбинации", "combos"),
+        ("⚔️ Дуэли", "duel"),
         ("🎡 Колесо", "wheel"),
         ("📊 Статистика", "stats"),
         ("❓ Помощь", "help")
@@ -176,6 +205,7 @@ def menu():
         k.button(text=text, callback_data=data)
 
     k.adjust(2)
+
     return k.as_markup()
 
 
@@ -206,6 +236,52 @@ def game_menu(uid):
     return k.as_markup()
 
 
+def duel_menu():
+    k = InlineKeyboardBuilder()
+
+    k.button(
+        text="⚔️ Создать дуэль",
+        callback_data="duel_create"
+    )
+
+    k.button(
+        text="🔎 Найти соперника",
+        callback_data="duel_find"
+    )
+
+    k.button(
+        text="🔙 Меню",
+        callback_data="menu"
+    )
+
+    k.adjust(1)
+
+    return k.as_markup()
+
+
+def duel_bets():
+    k = InlineKeyboardBuilder()
+
+    for b in BETS:
+        k.button(
+            text=f"💰 {b}",
+            callback_data=f"duel_bet:{b}"
+        )
+
+    k.button(
+        text="🔙 Назад",
+        callback_data="duel"
+    )
+
+    k.adjust(2, 1)
+
+    return k.as_markup()
+
+
+# =========================
+# START / COMMANDS
+# =========================
+
 @dp.message(CommandStart())
 async def start(message: Message):
     register(message.from_user)
@@ -215,7 +291,8 @@ async def start(message: Message):
         "Добро пожаловать!\n\n"
         "💰 Стартовый баланс: 1000\n"
         "⭐ Получай XP за каждую крутку\n"
-        "💎 Лови джекпот на 7️⃣7️⃣7️⃣\n\n"
+        "💎 Лови джекпот на 7️⃣7️⃣7️⃣\n"
+        "⚔️ Сражайся с другими игроками\n\n"
         "👇 Выбирай:",
         reply_markup=menu()
     )
@@ -235,6 +312,7 @@ async def slots(message: Message):
 @dp.message(Command("balance"))
 async def balance(message: Message):
     register(message.from_user)
+
     u = user(message.from_user.id)
 
     await message.answer(
@@ -244,13 +322,55 @@ async def balance(message: Message):
     )
 
 
+@dp.message(Command("bonus"))
+async def bonus_command(message: Message):
+    register(message.from_user)
+
+    uid = message.from_user.id
+    u = user(uid)
+
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
+
+    if u[8] == today:
+        await message.answer(
+            "🎁 Бонус уже получен сегодня!"
+        )
+        return
+
+    reward = 100 + level(uid) * 25
+
+    update(
+        uid,
+        "balance",
+        u[2] + reward
+    )
+
+    update(
+        uid,
+        "bonus",
+        today
+    )
+
+    await message.answer(
+        f"🎁 Получено <b>+{reward} 💰</b>"
+    )
+
+
+# =========================
+# MAIN MENU
+# =========================
+
 @dp.callback_query(F.data == "menu")
 async def menu_button(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     await call.message.edit_text(
-        "🎰 <b>СЛОТЫ</b>\n\n👇 Выбирай:",
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        "👇 Выбирай:",
         reply_markup=menu()
     )
 
@@ -258,20 +378,28 @@ async def menu_button(call: CallbackQuery):
 @dp.callback_query(F.data == "game")
 async def game_button(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     await call.message.edit_text(
-        f"🎰 <b>СЛОТЫ</b>\n\n"
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        f"🎯 Ставка: <b>{user(call.from_user.id)[7]}</b> 💰\n"
         f"💎 Джекпот: <b>{get_jackpot()}</b> 💰",
         reply_markup=game_menu(call.from_user.id)
     )
 
 
+# =========================
+# BET
+# =========================
+
 @dp.callback_query(F.data.startswith("bet:"))
 async def bet_button(call: CallbackQuery):
     register(call.from_user)
 
-    value = int(call.data.split(":")[1])
+    value = int(
+        call.data.split(":")[1]
+    )
 
     update(
         call.from_user.id,
@@ -291,6 +419,10 @@ async def bet_button(call: CallbackQuery):
     )
 
 
+# =========================
+# SPIN
+# =========================
+
 @dp.callback_query(F.data == "spin")
 async def spin(call: CallbackQuery):
     register(call.from_user)
@@ -306,9 +438,23 @@ async def spin(call: CallbackQuery):
         )
         return
 
-    update(uid, "balance", u[2] - bet)
-    update(uid, "spins", u[4] + 1)
-    update(uid, "xp", u[3] + 10)
+    update(
+        uid,
+        "balance",
+        u[2] - bet
+    )
+
+    update(
+        uid,
+        "spins",
+        u[4] + 1
+    )
+
+    update(
+        uid,
+        "xp",
+        u[3] + 10
+    )
 
     await call.answer()
 
@@ -358,9 +504,11 @@ async def spin(call: CallbackQuery):
         win = bet * 2
 
     else:
-        add_jackpot(max(1, bet // 10))
+        add_jackpot(
+            max(1, bet // 10)
+        )
 
-    if win > 0:
+    if win:
         now = user(uid)
 
         update(
@@ -389,10 +537,16 @@ async def spin(call: CallbackQuery):
             f"💎💎💎 <b>ДЖЕКПОТ!</b>\n"
             f"💰 +{win}"
         )
+
     elif win:
-        result_text = f"🎉 <b>Выигрыш +{win} 💰</b>"
+        result_text = (
+            f"🎉 <b>Выигрыш +{win} 💰</b>"
+        )
+
     else:
-        result_text = f"😢 Проигрыш -{bet} 💰"
+        result_text = (
+            f"😢 Проигрыш -{bet} 💰"
+        )
 
     await call.message.edit_text(
         "🎰 <b>РЕЗУЛЬТАТ</b>\n\n"
@@ -405,9 +559,14 @@ async def spin(call: CallbackQuery):
     )
 
 
+# =========================
+# PROFILE
+# =========================
+
 @dp.callback_query(F.data == "profile")
-async def profile_button(call: CallbackQuery):
+async def profile(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     u = user(call.from_user.id)
@@ -424,6 +583,10 @@ async def profile_button(call: CallbackQuery):
         reply_markup=menu()
     )
 
+
+# =========================
+# BONUS
+# =========================
 
 @dp.callback_query(F.data == "bonus")
 async def bonus(call: CallbackQuery):
@@ -469,9 +632,14 @@ async def bonus(call: CallbackQuery):
     )
 
 
+# =========================
+# TOP
+# =========================
+
 @dp.callback_query(F.data == "top")
 async def top(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     c = con()
@@ -501,9 +669,14 @@ async def top(call: CallbackQuery):
     )
 
 
+# =========================
+# COMBINATIONS
+# =========================
+
 @dp.callback_query(F.data == "combos")
 async def combos(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     await call.message.edit_text(
@@ -519,9 +692,14 @@ async def combos(call: CallbackQuery):
     )
 
 
+# =========================
+# STATS
+# =========================
+
 @dp.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     u = user(call.from_user.id)
@@ -536,6 +714,10 @@ async def stats(call: CallbackQuery):
         reply_markup=menu()
     )
 
+
+# =========================
+# WHEEL
+# =========================
 
 @dp.callback_query(F.data == "wheel")
 async def wheel(call: CallbackQuery):
@@ -572,7 +754,7 @@ async def wheel(call: CallbackQuery):
     )
 
     await call.answer(
-        f"🎡 Выпало +{reward} 💰"
+        f"🎡 +{reward} 💰"
     )
 
     await call.message.edit_text(
@@ -582,61 +764,310 @@ async def wheel(call: CallbackQuery):
     )
 
 
-@dp.callback_query(F.data == "help")
-async def help_button(call: CallbackQuery):
+# =========================
+# ⚔️ DUELS
+# =========================
+
+@dp.callback_query(F.data == "duel")
+async def duel(call: CallbackQuery):
     register(call.from_user)
+
     await call.answer()
 
     await call.message.edit_text(
-        "❓ <b>ПОМОЩЬ</b>\n\n"
-        "/start — меню\n"
-        "/slots — слоты\n"
-        "/balance — баланс\n"
-        "/bonus — бонус\n"
-        "/profile — профиль\n"
-        "/top — рейтинг\n\n"
-        "🎰 Выбирай ставку один раз.\n"
-        "После игры можно сразу крутить ещё.",
-        reply_markup=menu()
+        "⚔️ <b>ДУЭЛИ</b>\n\n"
+        "Сразись с другим игроком за монеты!\n\n"
+        "🏆 Победитель получает весь банк.\n"
+        "💰 Ставки: 10 / 25 / 50 / 100\n\n"
+        "Выбирай:",
+        reply_markup=duel_menu()
     )
 
 
-class Health(BaseHTTPRequestHandler):
+@dp.callback_query(F.data == "duel_create")
+async def duel_create(call: CallbackQuery):
+    register(call.from_user)
 
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+    uid = call.from_user.id
+    u = user(uid)
 
-    def log_message(self, format, *args):
-        pass
+    c = con()
 
+    active = c.execute(
+        """
+        SELECT id
+        FROM duels
+        WHERE creator=?
+        AND status='waiting'
+        """,
+        (uid,)
+    ).fetchone()
 
-def server():
-    port = int(os.getenv("PORT", "10000"))
+    c.close()
 
-    HTTPServer(
-        ("0.0.0.0", port),
-        Health
-    ).serve_forever()
+    if active:
+        await call.answer(
+            "❌ У тебя уже есть активная дуэль!",
+            show_alert=True
+        )
+        return
 
+    await call.answer()
 
-async def main():
-    init_db()
-
-    threading.Thread(
-        target=server,
-        daemon=True
-    ).start()
-
-    print("BOT STARTED")
-
-    await bot.delete_webhook(
-        drop_pending_updates=True
+    await call.message.edit_text(
+        "⚔️ <b>СОЗДАНИЕ ДУЭЛИ</b>\n\n"
+        f"💰 Твой баланс: <b>{u[2]}</b>\n\n"
+        "Выбери ставку:",
+        reply_markup=duel_bets()
     )
 
-    await dp.start_polling(bot)
+
+@dp.callback_query(F.data.startswith("duel_bet:"))
+async def duel_bet(call: CallbackQuery):
+    register(call.from_user)
+
+    uid = call.from_user.id
+    bet = int(call.data.split(":")[1])
+
+    if bet not in BETS:
+        await call.answer(
+            "❌ Неверная ставка!",
+            show_alert=True
+        )
+        return
+
+    u = user(uid)
+
+    if u[2] < bet:
+        await call.answer(
+            "❌ Недостаточно монет!",
+            show_alert=True
+        )
+        return
+
+    c = con()
+
+    active = c.execute(
+        """
+        SELECT id
+        FROM duels
+        WHERE creator=?
+        AND status='waiting'
+        """,
+        (uid,)
+    ).fetchone()
+
+    if active:
+        c.close()
+
+        await call.answer(
+            "❌ У тебя уже есть дуэль!",
+            show_alert=True
+        )
+        return
+
+    c.execute(
+        """
+        INSERT INTO duels(creator,bet,status)
+        VALUES(?,?,?)
+        """,
+        (uid, bet, "waiting")
+    )
+
+    duel_id = c.execute(
+        "SELECT last_insert_rowid()"
+    ).fetchone()[0]
+
+    c.commit()
+    c.close()
+
+    update(
+        uid,
+        "balance",
+        u[2] - bet
+    )
+
+    k = InlineKeyboardBuilder()
+
+    k.button(
+        text="🔎 Найти соперника",
+        callback_data="duel_find"
+    )
+
+    k.button(
+        text="❌ Отменить",
+        callback_data=f"duel_cancel:{duel_id}"
+    )
+
+    k.adjust(1)
+
+    await call.answer(
+        "⚔️ Дуэль создана!"
+    )
+
+    await call.message.edit_text(
+        "⚔️ <b>ДУЭЛЬ СОЗДАНА!</b>\n\n"
+        f"💰 Твоя ставка: <b>{bet}</b>\n"
+        "⏳ Ждём соперника...\n\n"
+        "Когда другой игрок найдёт твою дуэль,\n"
+        "битва начнётся автоматически.",
+        reply_markup=k.as_markup()
+    )
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@dp.callback_query(F.data == "duel_find")
+async def duel_find(call: CallbackQuery):
+    register(call.from_user)
+
+    uid = call.from_user.id
+    u = user(uid)
+
+    c = con()
+
+    d = c.execute(
+        """
+        SELECT id,creator,bet
+        FROM duels
+        WHERE status='waiting'
+        AND creator!=?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (uid,)
+    ).fetchone()
+
+    c.close()
+
+    if not d:
+        await call.answer(
+            "⏳ Сейчас нет доступных дуэлей.",
+            show_alert=True
+        )
+        return
+
+    duel_id = d[0]
+    creator = d[1]
+    bet = d[2]
+
+    if u[2] < bet:
+        await call.answer(
+            f"❌ Нужно {bet} 💰",
+            show_alert=True
+        )
+        return
+
+    update(
+        uid,
+        "balance",
+        u[2] - bet
+    )
+
+    c = con()
+
+    c.execute(
+        """
+        UPDATE duels
+        SET opponent=?,status='playing'
+        WHERE id=? AND status='waiting'
+        """,
+        (uid, duel_id)
+    )
+
+    c.commit()
+    c.close()
+
+    winner = random.choice(
+        [creator, uid]
+    )
+
+    total = bet * 2
+
+    wu = user(winner)
+
+    update(
+        winner,
+        "balance",
+        wu[2] + total
+    )
+
+    c = con()
+
+    c.execute(
+        """
+        UPDATE duels
+        SET status='finished',winner=?
+        WHERE id=?
+        """,
+        (winner, duel_id)
+    )
+
+    c.commit()
+    c.close()
+
+    if winner == uid:
+        text = (
+            "🏆 <b>ТЫ ПОБЕДИЛ!</b>\n\n"
+            f"💰 Твоя ставка: {bet}\n"
+            f"🏦 Банк: <b>{total} 💰</b>\n"
+            f"🎉 Тебе: <b>+{total} 💰</b>"
+        )
+    else:
+        text = (
+            "💀 <b>ТЫ ПРОИГРАЛ!</b>\n\n"
+            f"💰 Твоя ставка: {bet}\n"
+            f"🏦 Банк: <b>{total} 💰</b>\n"
+            "😢 Победил соперник."
+        )
+
+    await call.answer(
+        "🏆 Победа!" if winner == uid else "💀 Поражение!",
+        show_alert=True
+    )
+
+    await call.message.edit_text(
+        "⚔️ <b>РЕЗУЛЬТАТ ДУЭЛИ</b>\n\n"
+        f"🎲 Ставка: <b>{bet} 💰</b>\n"
+        f"🏦 Банк: <b>{total} 💰</b>\n\n"
+        f"{text}\n\n"
+        "⚔️ Можешь сразу сыграть ещё.",
+        reply_markup=duel_menu()
+    )
+
+
+@dp.callback_query(F.data.startswith("duel_cancel:"))
+async def duel_cancel(call: CallbackQuery):
+    register(call.from_user)
+
+    uid = call.from_user.id
+    duel_id = int(
+        call.data.split(":")[1]
+    )
+
+    c = con()
+
+    d = c.execute(
+        """
+        SELECT bet
+        FROM duels
+        WHERE id=? AND creator=? AND status='waiting'
+        """,
+        (duel_id, uid)
+    ).fetchone()
+
+    c.close()
+
+    if not d:
+        await call.answer(
+            "❌ Дуэль уже недоступна.",
+            show_alert=True
+        )
+        return
+
+    bet = d[0]
+    u = user(uid)
+
+    update(
+        uid,
+        "balance",
+        u[2] + bet
+    
