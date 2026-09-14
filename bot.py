@@ -1,414 +1,30 @@
 import os
-import random
 import sqlite3
-import threading
+import random
 import asyncio
-from datetime import datetime, timezone
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 TOKEN = os.getenv("BOT_TOKEN")
-DB_FILE = "slots.db"
+DB = "slots.db"
 
 bot = Bot(
     TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
-
 dp = Dispatcher()
 
-db_lock = threading.Lock()
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-conn.row_factory = sqlite3.Row
+SYMBOLS = ["🍒", "🍋", "🍊", "🔔", "💎", "7️⃣"]
 
-
-# =========================
-# DATABASE
-# =========================
-
-def db(sql, params=(), one=False):
-    with db_lock:
-        cur = conn.execute(sql, params)
-        conn.commit()
-        return cur.fetchone() if one else cur.fetchall()
-
-
-def init_db():
-    db("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY,
-        username TEXT DEFAULT '',
-        name TEXT DEFAULT '',
-        coins INTEGER DEFAULT 1000,
-        xp INTEGER DEFAULT 0,
-        spins INTEGER DEFAULT 0,
-        wins INTEGER DEFAULT 0,
-        best_win INTEGER DEFAULT 0,
-        bet INTEGER DEFAULT 10,
-        dice_games INTEGER DEFAULT 0,
-        dice_wins INTEGER DEFAULT 0,
-        duel_games INTEGER DEFAULT 0,
-        duel_wins INTEGER DEFAULT 0,
-        clan_id INTEGER DEFAULT 0,
-        wheel_day TEXT DEFAULT '',
-        mission_day TEXT DEFAULT '',
-        mission_spins INTEGER DEFAULT 0,
-        mission_wins INTEGER DEFAULT 0,
-        mission_coins INTEGER DEFAULT 0
-    )
-    """)
-
-    db("""
-    CREATE TABLE IF NOT EXISTS chats(
-        chat_id INTEGER PRIMARY KEY,
-        spins INTEGER DEFAULT 0,
-        wins INTEGER DEFAULT 0,
-        coins INTEGER DEFAULT 0
-    )
-    """)
-
-    db("""
-    CREATE TABLE IF NOT EXISTS chat_users(
-        chat_id INTEGER,
-        user_id INTEGER,
-        PRIMARY KEY(chat_id,user_id)
-    )
-    """)
-
-    db("""
-    CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value INTEGER
-    )
-    """)
-
-    if not db(
-        "SELECT * FROM settings WHERE key='jackpot'",
-        one=True
-    ):
-        db(
-            "INSERT INTO settings(key,value) VALUES('jackpot',5000)"
-        )
-
-
-# =========================
-# USER
-# =========================
-
-def register(m):
-    uid = m.from_user.id
-    username = m.from_user.username or ""
-    name = m.from_user.full_name[:40]
-
-    u = db(
-        "SELECT * FROM users WHERE id=?",
-        (uid,),
-        one=True
-    )
-
-    if not u:
-        db(
-            """
-            INSERT INTO users(id,username,name)
-            VALUES(?,?,?)
-            """,
-            (uid, username, name)
-        )
-    else:
-        db(
-            """
-            UPDATE users
-            SET username=?,name=?
-            WHERE id=?
-            """,
-            (username, name, uid)
-        )
-
-    if m.chat.type != "private":
-        db(
-            "INSERT OR IGNORE INTO chats(chat_id) VALUES(?)",
-            (m.chat.id,)
-        )
-        db(
-            """
-            INSERT OR IGNORE INTO chat_users(chat_id,user_id)
-            VALUES(?,?)
-            """,
-            (m.chat.id, uid)
-        )
-
-    return db(
-        "SELECT * FROM users WHERE id=?",
-        (uid,),
-        one=True
-    )
-
-
-def get_user(uid):
-    return db(
-        "SELECT * FROM users WHERE id=?",
-        (uid,),
-        one=True
-    )
-
-
-def level(xp):
-    return xp // 100 + 1
-
-
-def level_progress(xp):
-    return xp % 100
-
-
-def today():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def happy_hour():
-    h = datetime.now(timezone.utc).hour
-    return 18 <= h < 20
-
-
-# =========================
-# KEYBOARDS
-# =========================
-
-def main_keyboard():
-    b = InlineKeyboardBuilder()
-
-    b.button(text="🎰 Слоты", callback_data="game")
-    b.button(text="🎲 Кубик", callback_data="dice_menu")
-    b.button(text="⚔️ Дуэли", callback_data="duel_menu")
-    b.button(text="👤 Профиль", callback_data="profile")
-
-    b.button(text="🏆 Рейтинг", callback_data="top")
-    b.button(text="👥 Кланы", callback_data="clans")
-    b.button(text="🎯 Задания", callback_data="missions")
-    b.button(text="🎡 Колесо", callback_data="wheel")
-
-    b.button(text="📖 Комбинации", callback_data="combos")
-    b.button(text="📚 Помощь", callback_data="help")
-
-    b.adjust(2, 2, 2, 2, 2)
-    return b.as_markup()
-
-
-def game_keyboard(u):
-    b = InlineKeyboardBuilder()
-
-    b.button(
-        text="🎰 КРУТИТЬ",
-        callback_data="spin"
-    )
-
-    b.button(
-        text=f"💰 Ставка {u['bet']}",
-        callback_data="bets"
-    )
-
-    b.button(
-        text="👤 Профиль",
-        callback_data="profile"
-    )
-
-    b.button(
-        text="🏠 Меню",
-        callback_data="menu"
-    )
-
-    b.adjust(1, 2, 1)
-    return b.as_markup()
-
-
-def bet_keyboard():
-    b = InlineKeyboardBuilder()
-
-    for x in (10, 25, 50, 100):
-        b.button(
-            text=f"💰 {x}",
-            callback_data=f"bet:{x}"
-        )
-
-    b.button(
-        text="⬅️ Назад",
-        callback_data="game"
-    )
-
-    b.adjust(2, 2, 1)
-    return b.as_markup()
-
-
-# =========================
-# MAIN COMMANDS
-# =========================
-
-@dp.message(CommandStart())
-async def start(m: Message):
-    register(m)
-
-    await m.answer(
-        "🎰 <b>СЛОТЫ</b>\n\n"
-        "Добро пожаловать в игру!\n\n"
-        "🎰 Слоты\n"
-        "🎲 Кубики\n"
-        "⚔️ Дуэли\n"
-        "👥 Кланы\n"
-        "🏆 Рейтинги\n"
-        "🎯 Задания\n"
-        "🎡 Колесо\n"
-        "🏅 Достижения\n\n"
-        "Выбирай раздел 👇",
-        reply_markup=main_keyboard()
-    )
-
-
-@dp.message(Command("help"))
-async def help_command(m: Message):
-    register(m)
-
-    await m.answer(
-        "📚 <b>КОМАНДЫ</b>\n\n"
-        "/start — главное меню\n"
-        "/slots — играть в слоты\n"
-        "/balance — баланс\n"
-        "/bonus — ежедневный бонус\n"
-        "/profile — профиль\n"
-        "/top — рейтинг\n"
-        "/group — рейтинг группы\n"
-        "/pay — передать монеты\n"
-        "/dice — кубик\n"
-        "/duel — дуэль\n\n"
-        "Большинство функций можно использовать "
-        "через кнопки меню."
-    )
-
-
-@dp.message(Command("slots"))
-async def slots_command(m: Message):
-    register(m)
-    await show_game(m)
-
-
-@dp.message(Command("profile"))
-async def profile_command(m: Message):
-    register(m)
-    await show_profile(m)
-
-
-@dp.message(Command("balance"))
-async def balance_command(m: Message):
-    u = register(m)
-
-    await m.answer(
-        f"💰 Баланс: <b>{u['coins']}</b>\n"
-        f"⭐ Уровень: <b>{level(u['xp'])}</b>\n"
-        f"✨ XP: <b>{u['xp']}</b>"
-    )
-
-
-# =========================
-# GAME SCREEN
-# =========================
-
-async def show_game(m):
-    u = get_user(m.from_user.id)
-
-    jackpot = db(
-        "SELECT value FROM settings WHERE key='jackpot'",
-        one=True
-    )["value"]
-
-    hh = "\n🔥 <b>HAPPY HOUR АКТИВЕН!</b>" if happy_hour() else ""
-
-    text = (
-        "🎰 <b>СЛОТЫ</b>\n\n"
-        f"💰 Баланс: <b>{u['coins']}</b>\n"
-        f"⭐ Уровень: <b>{level(u['xp'])}</b>\n"
-        f"✨ XP: <b>{level_progress(u['xp'])}/100</b>\n"
-        f"💵 Ставка: <b>{u['bet']}</b>\n"
-        f"👑 Джекпот: <b>{jackpot}</b>"
-        f"{hh}\n\n"
-        "Нажми 🎰 КРУТИТЬ"
-    )
-
-    if hasattr(m, "message") and m.message:
-        await m.message.edit_text(
-            text,
-            reply_markup=game_keyboard(u)
-        )
-    else:
-        await m.answer(
-            text,
-            reply_markup=game_keyboard(u)
-        )
-
-
-@dp.callback_query(F.data == "game")
-async def game_callback(c: CallbackQuery):
-    await show_game(c)
-    await c.answer()
-
-
-# =========================
-# BET
-# =========================
-
-@dp.callback_query(F.data == "bets")
-async def bets_callback(c: CallbackQuery):
-    await c.message.edit_text(
-        "💰 <b>ВЫБЕРИ СТАВКУ</b>\n\n"
-        "После выбора она сохранится.\n"
-        "При следующем вращении выбирать её заново "
-        "не понадобится.",
-        reply_markup=bet_keyboard()
-    )
-    await c.answer()
-
-
-@dp.callback_query(F.data.startswith("bet:"))
-async def bet_callback(c: CallbackQuery):
-    amount = int(c.data.split(":")[1])
-
-    db(
-        "UPDATE users SET bet=? WHERE id=?",
-        (amount, c.from_user.id)
-    )
-
-    u = get_user(c.from_user.id)
-
-    await c.message.edit_text(
-        "🎰 <b>СТАВКА ИЗМЕНЕНА</b>\n\n"
-        f"💰 Текущая ставка: <b>{amount}</b>\n"
-        f"💰 Баланс: <b>{u['coins']}</b>\n\n"
-        "Теперь можно просто нажимать "
-        "🎰 <b>КРУТИТЬ</b>.",
-        reply_markup=game_keyboard(u)
-    )
-
-    await c.answer()
-
-
-# =========================
-# SLOT SPIN
-# =========================
-
-SYMBOLS = [
-    "🍒",
-    "🍋",
-    "🍊",
-    "🔔",
-    "💎",
-    "7️⃣"
-]
-
-MULTIPLIERS = {
+MULT = {
     "🍒": 5,
     "🍋": 7,
     "🍊": 10,
@@ -417,1212 +33,1300 @@ MULTIPLIERS = {
     "7️⃣": 100
 }
 
-
-async def spin_animation(c):
-    frames = [
-        "🎰 <b>🍒 | 🍋 | 🔔</b>",
-        "🎰 <b>💎 | 🍊 | 7️⃣</b>",
-        "🎰 <b>🔔 | 🍒 | 💎</b>",
-        "🎰 <b>🍋 | 7️⃣ | 🍊</b>",
-        "🎰 <b>💎 | 🔔 | 🍒</b>"
-    ]
-
-    for frame in frames:
-        try:
-            await c.message.edit_text(
-                frame + "\n\n⏳ <i>Прокрутка...</i>"
-            )
-        except Exception:
-            pass
-
-        await asyncio.sleep(0.35)
+BET_LIST = [10, 25, 50, 100]
 
 
-@dp.callback_query(F.data == "spin")
-async def spin_callback(c: CallbackQuery):
-    u = get_user(c.from_user.id)
+def db():
+    return sqlite3.connect(DB)
 
-    if not u:
-        await c.answer(
-            "Сначала нажми /start",
-            show_alert=True
-        )
-        return
 
-    bet = u["bet"]
+def init_db():
+    con = db()
+    cur = con.cursor()
 
-    if u["coins"] < bet:
-        await c.answer(
-            "❌ Недостаточно монет!",
-            show_alert=True
-        )
-        return
-
-    await c.answer()
-
-    await spin_animation(c)
-
-    a, b, d = random.choices(
-        SYMBOLS,
-        k=3
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        name TEXT,
+        balance INTEGER DEFAULT 1000,
+        xp INTEGER DEFAULT 0,
+        spins INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        best_win INTEGER DEFAULT 0,
+        bet INTEGER DEFAULT 10,
+        bonus_day TEXT DEFAULT '',
+        wheel_day TEXT DEFAULT '',
+        mission_day TEXT DEFAULT '',
+        mission_spins INTEGER DEFAULT 0,
+        mission_wins INTEGER DEFAULT 0
     )
-
-    jackpot = db(
-        "SELECT value FROM settings WHERE key='jackpot'",
-        one=True
-    )["value"]
-
-    win = 0
-    result = "💨 Не повезло..."
-
-    # Очень редкий супердроп
-    if random.randint(1, 10000) == 1:
-        win = 50000
-        result = "👑 <b>ЛЕГЕНДАРНЫЙ ДРОП!</b>\n💎 +50 000"
-
-    # Джекпот
-    elif a == b == d == "7️⃣":
-        win = jackpot
-        result = (
-            "👑 <b>ДЖЕКПОТ!</b>\n"
-            f"💰 +{jackpot}"
-        )
-
-        db(
-            "UPDATE settings SET value=5000 "
-            "WHERE key='jackpot'"
-        )
-
-    # Три одинаковых
-    elif a == b == d:
-        mult = MULTIPLIERS[a]
-        win = bet * mult
-        result = (
-            f"🔥 <b>ТРОЙКА!</b>\n"
-            f"{a}{b}{d} — x{mult}"
-        )
-
-    # Два одинаковых
-    elif a == b or a == d or b == d:
-        win = bet * 2
-        result = "✨ <b>ДВА ОДИНАКОВЫХ!</b> — x2"
-
-    # Happy Hour
-    if win > 0 and happy_hour():
-        win *= 2
-        result += "\n🔥 <b>HAPPY HOUR x2!</b>"
-
-    new_coins = u["coins"] - bet + win
-    new_xp = u["xp"] + 10
-    new_best = max(u["best_win"], win)
-
-    db(
-        """
-        UPDATE users SET
-        coins=?,
-        xp=?,
-        spins=spins+1,
-        wins=wins+?,
-        best_win=?,
-        mission_spins=mission_spins+1,
-        mission_wins=mission_wins+?,
-        mission_coins=mission_coins+?
-        WHERE id=?
-        """,
-        (
-            new_coins,
-            new_xp,
-            1 if win > 0 else 0,
-            new_best,
-            1 if win > 0 else 0,
-            win,
-            u["id"]
-        )
-    )
-
-    # Пополняем джекпот
-    db(
-        """
-        UPDATE settings
-        SET value=value+?
-        WHERE key='jackpot'
-        """,
-        (max(1, bet // 10),)
-    )
-
-    # Статистика группы
-    if c.message.chat.type != "private":
-        db(
-            """
-            INSERT OR IGNORE INTO chats(chat_id)
-            VALUES(?)
-            """,
-            (c.message.chat.id,)
-        )
-
-        db(
-            """
-            UPDATE chats
-            SET spins=spins+1,
-                wins=wins+?,
-                coins=coins+?
-            WHERE chat_id=?
-            """,
-            (
-                1 if win > 0 else 0,
-                win,
-                c.message.chat.id
-            )
-        )
-
-    text = (
-        f"🎰 <b>{a} | {b} | {d}</b>\n\n"
-        f"{result}\n\n"
-        f"💵 Ставка: <b>{bet}</b>\n"
-        f"🏆 Выигрыш: <b>{win}</b>\n"
-        f"💰 Баланс: <b>{new_coins}</b>\n"
-        f"⭐ Уровень: <b>{level(new_xp)}</b>\n"
-        f"✨ XP: <b>{level_progress(new_xp)}/100</b>"
-    )
-
-    bld = InlineKeyboardBuilder()
-
-    bld.button(
-        text="🎰 КРУТИТЬ ЕЩЁ РАЗ",
-        callback_data="spin"
-    )
-
-    bld.button(
-        text="💰 Изменить ставку",
-        callback_data="bets"
-    )
-
-    bld.button(
-        text="👤 Профиль",
-        callback_data="profile"
-    )
-
-    bld.button(
-        text="🏠 Меню",
-        callback_data="menu"
-    )
-
-    bld.adjust(1, 2, 1)
-
-    await c.message.edit_text(
-        text,
-        reply_markup=bld.as_markup()
-    )
-
-
-# =========================
-# PROFILE
-# =========================
-
-def profile_keyboard():
-    b = InlineKeyboardBuilder()
-
-    b.button(
-        text="🏅 Достижения",
-        callback_data="achievements"
-    )
-
-    b.button(
-        text="📊 Статистика",
-        callback_data="statistics"
-    )
-
-    b.button(
-        text="👥 Мой клан",
-        callback_data="my_clan"
-    )
-
-    b.button(
-        text="🏆 Мой рейтинг",
-        callback_data="my_rating"
-    )
-
-    b.button(
-        text="🏠 Главное меню",
-        callback_data="menu"
-    )
-
-    b.adjust(2, 2, 1)
-    return b.as_markup()
-
-
-async def show_profile(obj):
-    uid = obj.from_user.id
-    u = get_user(uid)
-
-    if not u:
-        return
-
-    name = u["name"]
-
-    need = (level(u["xp"])) * 100
-    current = level_progress(u["xp"])
-
-    clan_text = (
-        f"👥 Клан ID: <b>{u['clan_id']}</b>"
-        if u["clan_id"]
-        else "👥 Клан: <b>нет</b>"
-    )
-
-    text = (
-        "👤 <b>ПРОФИЛЬ</b>\n\n"
-        f"👤 Игрок: <b>{name}</b>\n"
-        f"🆔 ID: <code>{uid}</code>\n\n"
-        f"💰 Баланс: <b>{u['coins']}</b>\n"
-        f"⭐ Уровень: <b>{level(u['xp'])}</b>\n"
-        f"✨ XP: <b>{current}/100</b>\n\n"
-        f"🎰 Вращений: <b>{u['spins']}</b>\n"
-        f"🏆 Побед: <b>{u['wins']}</b>\n"
-        f"💎 Лучший выигрыш: <b>{u['best_win']}</b>\n\n"
-        f"🎲 Игр в кости: <b>{u['dice_games']}</b>\n"
-        f"🎲 Побед в костях: <b>{u['dice_wins']}</b>\n"
-        f"⚔️ Дуэлей: <b>{u['duel_games']}</b>\n"
-        f"⚔️ Побед в дуэлях: <b>{u['duel_wins']}</b>\n\n"
-        f"{clan_text}"
-    )
-
-    if isinstance(obj, CallbackQuery):
-        await obj.message.edit_text(
-            text,
-            reply_markup=profile_keyboard()
-        )
-    else:
-        await obj.answer(
-            text,
-            reply_markup=profile_keyboard()
-        )
-
-
-@dp.callback_query(F.data == "profile")
-async def profile_callback(c: CallbackQuery):
-    await show_profile(c)
-    await c.answer()
-
-
-# =========================
-# MENU
-# =========================
-
-@dp.callback_query(F.data == "menu")
-async def menu_callback(c: CallbackQuery):
-    await c.message.edit_text(
-        "🎰 <b>ГЛАВНОЕ МЕНЮ</b>\n\n"
-        "Выбери нужный раздел 👇",
-        reply_markup=main_keyboard()
-    )
-    await c.answer()
-    # =========================
-# DAILY BONUS
-# =========================
-
-@dp.message(Command("bonus"))
-async def bonus_command(m: Message):
-    u = register(m)
-    d = today()
-
-    if u["mission_day"] == d:
-        await m.answer("🎁 Ежедневный бонус уже получен сегодня.")
-        return
-
-    amount = 100 + level(u["xp"]) * 25
-
-    db(
-        """
-        UPDATE users
-        SET coins=coins+?,
-            mission_day=?
-        WHERE id=?
-        """,
-        (amount, d, u["id"])
-    )
-
-    await m.answer(
-        f"🎁 <b>ЕЖЕДНЕВНЫЙ БОНУС</b>\n\n"
-        f"Ты получил: <b>+{amount} 💰</b>"
-    )
-
-
-# =========================
-# DICE
-# =========================
-
-@dp.callback_query(F.data == "dice_menu")
-async def dice_menu(c: CallbackQuery):
-    await c.message.edit_text(
-        "🎲 <b>ИГРА В КУБИК</b>\n\n"
-        "Стоимость броска: <b>50 💰</b>\n\n"
-        "Выпало 4, 5 или 6 — победа!\n"
-        "Награда: <b>100 💰</b>\n\n"
-        "Нажми бросить 👇",
-        reply_markup=dice_keyboard()
-    )
-    await c.answer()
-
-
-def dice_keyboard():
-    b = InlineKeyboardBuilder()
-    b.button(text="🎲 БРОСИТЬ", callback_data="dice")
-    b.button(text="🏠 Меню", callback_data="menu")
-    b.adjust(1)
-    return b.as_markup()
-
-
-@dp.message(Command("dice"))
-async def dice_command(m: Message):
-    register(m)
-    await play_dice(m)
-
-
-async def play_dice(obj):
-    uid = obj.from_user.id
-    u = get_user(uid)
-
-    if not u or u["coins"] < 50:
-        text = "❌ Для игры нужно минимум <b>50 💰</b>."
-        if isinstance(obj, CallbackQuery):
-            await obj.answer(text, show_alert=True)
-        else:
-            await obj.answer(text)
-        return
-
-    roll = random.randint(1, 6)
-
-    win = roll >= 4
-
-    if win:
-        db(
-            """
-            UPDATE users
-            SET coins=coins+50,
-                dice_games=dice_games+1,
-                dice_wins=dice_wins+1
-            WHERE id=?
-            """,
-            (uid,)
-        )
-
-        result = (
-            f"🎲 Выпало: <b>{roll}</b>\n\n"
-            "🎉 <b>ПОБЕДА!</b>\n"
-            "💰 +50"
-        )
-    else:
-        db(
-            """
-            UPDATE users
-            SET coins=coins-50,
-                dice_games=dice_games+1
-            WHERE id=?
-            """,
-            (uid,)
-        )
-
-        result = (
-            f"🎲 Выпало: <b>{roll}</b>\n\n"
-            "💨 <b>ПРОИГРЫШ</b>\n"
-            "💰 -50"
-        )
-
-    if isinstance(obj, CallbackQuery):
-        await obj.message.edit_text(
-            "🎲 <b>КУБИК</b>\n\n" + result,
-            reply_markup=dice_keyboard()
-        )
-        await obj.answer()
-    else:
-        await obj.answer(
-            "🎲 <b>КУБИК</b>\n\n" + result
-        )
-
-
-@dp.callback_query(F.data == "dice")
-async def dice_callback(c: CallbackQuery):
-    await play_dice(c)
-
-
-# =========================
-# DUELS
-# =========================
-
-@dp.callback_query(F.data == "duel_menu")
-async def duel_menu(c: CallbackQuery):
-    await c.message.edit_text(
-        "⚔️ <b>ДУЭЛИ</b>\n\n"
-        "Сразись с другим игроком на монеты.\n\n"
-        "Чтобы вызвать игрока, ответь на его сообщение:\n\n"
-        "<code>/duel 100</code>\n\n"
-        "Оба игрока бросают кубик 🎲.\n"
-        "У кого больше — тот забирает ставку.",
-        reply_markup=back_keyboard()
-    )
-    await c.answer()
-
-
-def back_keyboard():
-    b = InlineKeyboardBuilder()
-    b.button(text="🏠 Главное меню", callback_data="menu")
-    return b.as_markup()
-
-
-@dp.message(Command("duel"))
-async def duel_command(m: Message):
-    a = register(m)
-
-    if not m.reply_to_message:
-        await m.answer(
-            "⚔️ <b>ДУЭЛЬ</b>\n\n"
-            "Ответь на сообщение игрока и напиши:\n"
-            "<code>/duel 100</code>"
-        )
-        return
-
-    target = register(m.reply_to_message)
-
-    if target["id"] == a["id"]:
-        await m.answer("❌ Нельзя вызвать самого себя.")
-        return
-
-    parts = m.text.split()
-    amount = 100
-
-    if len(parts) > 1:
-        try:
-            amount = int(parts[1])
-        except ValueError:
-            await m.answer("❌ Неверная ставка.")
-            return
-
-    if amount <= 0:
-        await m.answer("❌ Ставка должна быть больше нуля.")
-        return
-
-    if a["coins"] < amount:
-        await m.answer("❌ У тебя недостаточно монет.")
-        return
-
-    if target["coins"] < amount:
-        await m.answer("❌ У соперника недостаточно монет.")
-        return
-
-    ra = random.randint(1, 6)
-    rb = random.randint(1, 6)
-
-    db(
-        """
-        UPDATE users
-        SET coins=coins-?,
-            duel_games=duel_games+1
-        WHERE id=?
-        """,
-        (amount, a["id"])
-    )
-
-    db(
-        """
-        UPDATE users
-        SET coins=coins-?,
-            duel_games=duel_games+1
-        WHERE id=?
-        """,
-        (amount, target["id"])
-    )
-
-    if ra == rb:
-        db(
-            "UPDATE users SET coins=coins+? WHERE id=?",
-            (amount, a["id"])
-        )
-        db(
-            "UPDATE users SET coins=coins+? WHERE id=?",
-            (amount, target["id"])
-        )
-
-        await m.answer(
-            "⚔️ <b>ДУЭЛЬ — НИЧЬЯ!</b>\n\n"
-            f"👤 {a['name']}: 🎲 {ra}\n"
-            f"👤 {target['name']}: 🎲 {rb}\n\n"
-            "💰 Ставки возвращены."
-        )
-        return
-
-    if ra > rb:
-        winner = a
-        loser = target
-        rw = ra
-        rl = rb
-    else:
-        winner = target
-        loser = a
-        rw = rb
-        rl = ra
-
-    prize = amount * 2
-
-    db(
-        """
-        UPDATE users
-        SET coins=coins+?,
-            duel_wins=duel_wins+1
-        WHERE id=?
-        """,
-        (prize, winner["id"])
-    )
-
-    await m.answer(
-        "⚔️ <b>ДУЭЛЬ ЗАВЕРШЕНА!</b>\n\n"
-        f"👤 {a['name']}: 🎲 {ra}\n"
-        f"👤 {target['name']}: 🎲 {rb}\n\n"
-        f"👑 Победитель: <b>{winner['name']}</b>\n"
-        f"💰 Приз: <b>{prize}</b>"
-    )
-
-
-# =========================
-# CLANS
-# =========================
-
-@dp.callback_query(F.data == "clans")
-async def clans_menu(c: CallbackQuery):
-    u = get_user(c.from_user.id)
-
-    if u["clan_id"]:
-        clan = db(
-            "SELECT * FROM clans WHERE id=?",
-            (u["clan_id"],),
-            one=True
-        )
-
-        if clan:
-            await show_clan(c, clan)
-            return
-
-    await c.message.edit_text(
-        "👥 <b>КЛАНЫ</b>\n\n"
-        "Ты пока не состоишь в клане.\n\n"
-        "Создать клан:\n"
-        "<code>/clan_create Название</code>\n\n"
-        "Вступить в клан:\n"
-        "<code>/clan_join ID</code>\n\n"
-        "Посмотреть кланы:\n"
-        "<code>/clans</code>",
-        reply_markup=back_keyboard()
-    )
-    await c.answer()
-
-
-def ensure_clans():
-    db("""
-    CREATE TABLE IF NOT EXISTS clans(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE,
-        owner_id INTEGER,
-        treasury INTEGER DEFAULT 0,
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chats(
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        spins INTEGER DEFAULT 0,
+        coins INTEGER DEFAULT 0,
         wins INTEGER DEFAULT 0
     )
     """)
 
-    db("""
-    CREATE TABLE IF NOT EXISTS clan_members(
-        clan_id INTEGER,
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chat_users(
+        chat_id INTEGER,
         user_id INTEGER,
-        PRIMARY KEY(clan_id,user_id)
+        PRIMARY KEY(chat_id,user_id)
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS duels(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        user1 INTEGER,
+        user2 INTEGER,
+        bet INTEGER,
+        status TEXT
+    )
+    """)
 
-@dp.message(Command("clan_create"))
-async def clan_create(m: Message):
-    ensure_clans()
-    u = register(m)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clans(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        owner INTEGER
+    )
+    """)
 
-    if u["clan_id"]:
-        await m.answer("❌ Ты уже состоишь в клане.")
-        return
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clan_users(
+        clan_id INTEGER,
+        user_id INTEGER UNIQUE
+    )
+    """)
 
-    parts = m.text.split(maxsplit=1)
-
-    if len(parts) < 2:
-        await m.answer(
-            "👥 Использование:\n"
-            "<code>/clan_create Название</code>"
-        )
-        return
-
-    name = parts[1].strip()[:30]
-
-    try:
-        db(
-            """
-            INSERT INTO clans(name,owner_id)
-            VALUES(?,?)
-            """,
-            (name, u["id"])
-        )
-
-        clan = db(
-            "SELECT * FROM clans WHERE name=?",
-            (name,),
-            one=True
-        )
-
-        db(
-            """
-            INSERT INTO clan_members(clan_id,user_id)
-            VALUES(?,?)
-            """,
-            (clan["id"], u["id"])
-        )
-
-        db(
-            "UPDATE users SET clan_id=? WHERE id=?",
-            (clan["id"], u["id"])
-        )
-
-        await m.answer(
-            f"👑 <b>КЛАН СОЗДАН!</b>\n\n"
-            f"👥 {name}\n"
-            f"🆔 ID: <b>{clan['id']}</b>"
-        )
-
-    except sqlite3.IntegrityError:
-        await m.answer("❌ Такое название клана уже занято.")
+    con.commit()
+    con.close()
 
 
-@dp.message(Command("clan_join"))
-async def clan_join(m: Message):
-    ensure_clans()
-    u = register(m)
+def register_user(user, chat=None):
+    con = db()
+    cur = con.cursor()
 
-    if u["clan_id"]:
-        await m.answer("❌ Ты уже состоишь в клане.")
-        return
+    name = user.full_name or "Игрок"
+    username = user.username or ""
 
-    parts = m.text.split()
-
-    if len(parts) < 2:
-        await m.answer(
-            "Использование:\n"
-            "<code>/clan_join ID</code>"
-        )
-        return
-
-    try:
-        cid = int(parts[1])
-    except ValueError:
-        await m.answer("❌ Неверный ID клана.")
-        return
-
-    clan = db(
-        "SELECT * FROM clans WHERE id=?",
-        (cid,),
-        one=True
+    cur.execute(
+        "INSERT OR IGNORE INTO users(id,username,name) VALUES(?,?,?)",
+        (user.id, username, name)
     )
 
-    if not clan:
-        await m.answer("❌ Клан не найден.")
-        return
-
-    db(
-        """
-        INSERT INTO clan_members(clan_id,user_id)
-        VALUES(?,?)
-        """,
-        (cid, u["id"])
+    cur.execute(
+        "UPDATE users SET username=?, name=? WHERE id=?",
+        (username, name, user.id)
     )
 
-    db(
-        "UPDATE users SET clan_id=? WHERE id=?",
-        (cid, u["id"])
-    )
-
-    await m.answer(
-        f"👥 Ты вступил в клан <b>{clan['name']}</b>!"
-    )
-
-
-@dp.message(Command("clans"))
-async def clans_command(m: Message):
-    ensure_clans()
-    register(m)
-
-    rows = db(
-        """
-        SELECT c.id,c.name,c.treasury,
-        COUNT(cm.user_id) members
-        FROM clans c
-        LEFT JOIN clan_members cm
-        ON cm.clan_id=c.id
-        GROUP BY c.id
-        ORDER BY c.treasury DESC
-        LIMIT 15
-        """
-    )
-
-    if not rows:
-        await m.answer(
-            "👥 Кланов пока нет.\n\n"
-            "Создай первый:\n"
-            "<code>/clan_create Название</code>"
+    if chat:
+        cur.execute(
+            "INSERT OR IGNORE INTO chats(id,title) VALUES(?,?)",
+            (chat.id, chat.title or "Чат")
         )
-        return
-
-    text = "👥 <b>ТОП КЛАНОВ</b>\n\n"
-
-    for i, x in enumerate(rows, 1):
-        text += (
-            f"{i}. <b>{x['name']}</b>\n"
-            f"🆔 {x['id']} | 👤 {x['members']} | "
-            f"💰 {x['treasury']}\n\n"
+        cur.execute(
+            "INSERT OR IGNORE INTO chat_users(chat_id,user_id) VALUES(?,?)",
+            (chat.id, user.id)
         )
 
-    await m.answer(text)
+    con.commit()
+    con.close()
 
 
-async def show_clan(c, clan):
-    members = db(
-        """
-        SELECT COUNT(*) amount
-        FROM clan_members
-        WHERE clan_id=?
-        """,
-        (clan["id"],),
-        one=True
-    )["amount"]
+def get_user(uid):
+    con = db()
+    row = con.execute(
+        "SELECT * FROM users WHERE id=?",
+        (uid,)
+    ).fetchone()
+    con.close()
+    return row
 
-    owner = get_user(clan["owner_id"])
+
+def update_user(uid, field, value):
+    allowed = {
+        "balance", "xp", "spins", "wins", "best_win",
+        "bet", "bonus_day", "wheel_day", "mission_day",
+        "mission_spins", "mission_wins"
+    }
+
+    if field not in allowed:
+        return
+
+    con = db()
+    con.execute(
+        f"UPDATE users SET {field}=? WHERE id=?",
+        (value, uid)
+    )
+    con.commit()
+    con.close()
+
+
+def add_xp(uid, amount):
+    u = get_user(uid)
+    if not u:
+        return
+
+    update_user(uid, "xp", u[4] + amount)
+
+
+def level(uid):
+    u = get_user(uid)
+    if not u:
+        return 1
+    return u[4] // 100 + 1
+
+
+def main_keyboard():
+    kb = InlineKeyboardBuilder()
+
+    kb.button(text="🎰 Слоты", callback_data="game")
+    kb.button(text="👤 Профиль", callback_data="profile")
+
+    kb.button(text="🏆 Топ", callback_data="top")
+    kb.button(text="🔢 Комбинации", callback_data="combos")
+
+    kb.button(text="🎲 Дуэль", callback_data="duel")
+    kb.button(text="📋 Миссии", callback_data="missions")
+
+    kb.button(text="🎡 Колесо", callback_data="wheel")
+    kb.button(text="⏰ Счастливый час", callback_data="happy")
+
+    kb.button(text="👥 Группа", callback_data="group")
+    kb.button(text="🏅 Достижения", callback_data="achievements")
+
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def game_keyboard(uid):
+    u = get_user(uid)
+    bet = u[8] if u else 10
+
+    kb = InlineKeyboardBuilder()
+
+    kb.button(text=f"🎰 КРУТИТЬ • {bet} 💰", callback_data="spin")
+    kb.button(text="💰 10", callback_data="bet:10")
+    kb.button(text="💰 25", callback_data="bet:25")
+    kb.button(text="💰 50", callback_data="bet:50")
+    kb.button(text="💰 100", callback_data="bet:100")
+    kb.button(text="🔙 Меню", callback_data="menu")
+
+    kb.adjust(1, 4, 1)
+    return kb.as_markup()
+
+
+async def game_screen(message, uid):
+    u = get_user(uid)
+    if not u:
+        return
 
     text = (
-        "👥 <b>МОЙ КЛАН</b>\n\n"
-        f"🏰 <b>{clan['name']}</b>\n"
-        f"🆔 ID: <b>{clan['id']}</b>\n"
-        f"👑 Глава: <b>{owner['name']}</b>\n"
-        f"👤 Участников: <b>{members}</b>\n"
-        f"💰 Казна: <b>{clan['treasury']}</b>\n"
-        f"🏆 Победы: <b>{clan['wins']}</b>\n\n"
-        "Для пополнения казны:\n"
-        "<code>/clan_pay 100</code>"
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        f"💰 Баланс: <b>{u[3]}</b>\n"
+        f"⭐ Уровень: <b>{level(uid)}</b>\n"
+        f"✨ XP: <b>{u[4]}</b>\n"
+        f"🎯 Ставка: <b>{u[8]}</b> 💰\n\n"
+        "Выбери ставку один раз и крути снова."
     )
 
-    await c.message.edit_text(
+    await message.edit_text(
         text,
-        reply_markup=back_keyboard()
+        reply_markup=game_keyboard(uid)
     )
 
 
-@dp.message(Command("clan_pay"))
-async def clan_pay(m: Message):
-    ensure_clans()
-    u = register(m)
-
-    if not u["clan_id"]:
-        await m.answer("❌ Ты не состоишь в клане.")
-        return
-
-    parts = m.text.split()
-
-    if len(parts) < 2:
-        await m.answer(
-            "Использование:\n"
-            "<code>/clan_pay 100</code>"
-        )
-        return
-
-    try:
-        amount = int(parts[1])
-    except ValueError:
-        await m.answer("❌ Неверная сумма.")
-        return
-
-    if amount <= 0 or u["coins"] < amount:
-        await m.answer("❌ Недостаточно монет.")
-        return
-
-    db(
-        "UPDATE users SET coins=coins-? WHERE id=?",
-        (amount, u["id"])
-    )
-
-    db(
-        "UPDATE clans SET treasury=treasury+? WHERE id=?",
-        (amount, u["clan_id"])
-    )
-
-    await m.answer(
-        f"👥 В казну клана внесено <b>{amount} 💰</b>."
-    )
-
-
-# =========================
-# TOP
-# =========================
-
-@dp.callback_query(F.data == "top")
-async def top_callback(c: CallbackQuery):
-    await show_top(c)
-
-
-@dp.message(Command("top"))
-async def top_command(m: Message):
-    register(m)
-    await show_top(m)
-
-
-async def show_top(obj):
-    rows = db(
-        """
-        SELECT name,coins,spins,wins,best_win
-        FROM users
-        ORDER BY coins DESC
-        LIMIT 10
-        """
-    )
-
-    text = "🏆 <b>ТОП ЛУДИКОВ</b>\n\n"
-
-    for i, x in enumerate(rows, 1):
-        text += (
-            f"{i}. <b>{x['name']}</b>\n"
-            f"💰 {x['coins']} | 🎰 {x['spins']} | "
-            f"🏆 {x['wins']}\n"
-        )
-
-    b = InlineKeyboardBuilder()
-    b.button(text="🏠 Меню", callback_data="menu")
-
-    if isinstance(obj, CallbackQuery):
-        await obj.message.edit_text(
-            text,
-            reply_markup=b.as_markup()
-        )
-        await obj.answer()
-    else:
-        await obj.answer(
-            text,
-            reply_markup=b.as_markup()
-        )
-
-
-# =========================
-# GROUP TOP
-# =========================
-
-@dp.message(Command("group"))
-async def group_command(m: Message):
-    if m.chat.type == "private":
-        await m.answer("👥 Эта команда работает в группе.")
-        return
-
-    register(m)
-
-    rows = db(
-        """
-        SELECT u.name,u.coins,u.wins
-        FROM users u
-        JOIN chat_users c
-        ON c.user_id=u.id
-        WHERE c.chat_id=?
-        ORDER BY u.coins DESC
-        LIMIT 10
-        """,
-        (m.chat.id,)
-    )
-
-    st = db(
-        "SELECT * FROM chats WHERE chat_id=?",
-        (m.chat.id,),
-        one=True
-    )
-
-    text = (
-        "👥 <b>СТАТИСТИКА ГРУППЫ</b>\n\n"
-        f"🎰 Игр: <b>{st['spins']}</b>\n"
-        f"🏆 Побед: <b>{st['wins']}</b>\n"
-        f"💰 Выиграно: <b>{st['coins']}</b>\n\n"
-        "🏆 <b>ТОП ГРУППЫ</b>\n\n"
-    )
-
-    for i, x in enumerate(rows, 1):
-        text += (
-            f"{i}. {x['name']} — "
-            f"💰 {x['coins']} | 🏆 {x['wins']}\n"
-        )
-
-    await m.answer(text)
-
-
-# =========================
-# TRANSFER
-# =========================
-
-@dp.message(Command("pay"))
-async def pay_command(m: Message):
-    sender = register(m)
-
-    if not m.reply_to_message:
-        await m.answer(
-            "💸 Чтобы передать монеты:\n\n"
-            "Ответь на сообщение игрока и напиши:\n"
-            "<code>/pay 500</code>"
-        )
-        return
-
-    target = register(m.reply_to_message)
-
-    parts = m.text.split()
-
-    if len(parts) < 2:
-        await m.answer("❌ Укажи сумму.")
-        return
-
-    try:
-        amount = int(parts[1])
-    except ValueError:
-        await m.answer("❌ Неверная сумма.")
-        return
-
-    if amount <= 0:
-        await m.answer("❌ Сумма должна быть больше нуля.")
-        return
-
-    if sender["coins"] < amount:
-        await m.answer("❌ Недостаточно монет.")
-        return
-
-    if sender["id"] == target["id"]:
-        await m.answer("❌ Нельзя отправить монеты самому себе.")
-        return
-
-    db(
-        "UPDATE users SET coins=coins-? WHERE id=?",
-        (amount, sender["id"])
-    )
-
-    db(
-        "UPDATE users SET coins=coins+? WHERE id=?",
-        (amount, target["id"])
-    )
-
-    await m.answer(
-        f"💸 <b>{amount} 💰</b> передано игроку "
-        f"<b>{target['name']}</b>!"
-    )
-
-
-# =========================
-# MISSIONS
-# =========================
-
-@dp.callback_query(F.data == "missions")
-async def missions_callback(c: CallbackQuery):
-    await show_missions(c)
-
-
-async def show_missions(obj):
-    u = get_user(obj.from_user.id)
-
-    text = (
-        "🎯 <b>ЕЖЕДНЕВНЫЕ ЗАДАНИЯ</b>\n\n"
-        f"🎰 10 вращений: "
-        f"<b>{min(u['mission_spins'],10)}/10</b>\n"
-        f"🏆 5 побед: "
-        f"<b>{min(u['mission_wins'],5)}/5</b>\n"
-        f"💰 Выиграть 1000: "
-        f"<b>{min(u['mission_coins'],1000)}/1000</b>\n\n"
-        "🎁 Награда за выполнение: <b>500 💰</b>"
-    )
-
-    b = InlineKeyboardBuilder()
-    b.button(text="🎁 Забрать награду", callback_data="claim_mission")
-    b.button(text="🏠 Меню", callback_data="menu")
-    b.adjust(1)
-
-    if isinstance(obj, CallbackQuery):
-        await obj.message.edit_text(
-            text,
-            reply_markup=b.as_markup()
-        )
-        await obj.answer()
-    else:
-        await obj.answer(
-            text,
-            reply_markup=b.as_markup()
-        )
-
-
-@dp.message(Command("missions"))
-async def missions_command(m: Message):
-    register(m)
-    await show_missions(m)
-
-
-@dp.callback_query(F.data == "claim_mission")
-async def claim_mission(c: CallbackQuery):
-    u = get_user(c.from_user.id)
-
-    if (
-        u["mission_spins"] < 10
-        or u["mission_wins"] < 5
-        or u["mission_coins"] < 1000
-    ):
-        await c.answer(
-            "❌ Все задания ещё не выполнены.",
-            show_alert=True
-        )
-        return
-
-    db(
-        """
-        UPDATE users
-        SET coins=coins+500,
-            mission_spins=0,
-            mission_wins=0,
-            mission_coins=0
-        WHERE id=?
-        """,
-        (u["id"],)
-    )
-
-    await c.answer("🎁 +500 💰")
-    await show_missions(c)
-
-
-# =========================
-# WHEEL
-# =========================
-
-@dp.callback_query(F.data == "wheel")
-async def wheel_callback(c: CallbackQuery):
-    u = get_user(c.from_user.id)
-
-    if u["wheel_day"] == today():
-        await c.answer(
-            "🎡 Сегодня колесо уже использовано.",
-            show_alert=True
-        )
-        return
-
-    prizes = [50, 100, 150, 250, 500, 1000, 2000]
-    prize = random.choice(prizes)
-
-    db(
-        """
-        UPDATE users
-        SET coins=coins+?,
-            wheel_day=?
-        WHERE id=?
-        """,
-        (prize, today(), u["id"])
-    )
-
-    await c.message.edit_text(
-        "🎡 <b>КОЛЕСО УДАЧИ</b>\n\n"
-        "🎰 Колесо вращается...\n\n"
-        f"🎉 Твой приз: <b>+{prize} 💰</b>",
+@dp.message(CommandStart())
+async def start(message: Message):
+    register_user(message.from_user, message.chat)
+
+    await message.answer(
+        "🎰 <b>Добро пожаловать в СЛОТЫ!</b>\n\n"
+        "Крути барабаны, выигрывай 💰, "
+        "повышай уровень и попадай в топ!\n\n"
+        "Выбирай действие:",
         reply_markup=main_keyboard()
     )
 
-    await c.answer()
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    await message.answer(
+        "📖 <b>КОМАНДЫ</b>\n\n"
+        "/start — главное меню\n"
+        "/slots — открыть слоты\n"
+        "/balance — баланс\n"
+        "/bonus — ежедневный бонус\n"
+        "/top — рейтинг\n"
+        "/profile — профиль\n"
+        "/group — статистика группы\n"
+        "/pay 100 — перевод игроку ответом\n"
+        "/help — помощь"
+    )
 
 
-# =========================
-# ACHIEVEMENTS
-# =========================
+@dp.message(Command("slots"))
+async def slots_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    await message.answer(
+        "🎰 <b>СЛОТЫ</b>\n\n"
+        "Текущая ставка сохранится.\n"
+        "Можно просто нажимать «КРУТИТЬ» снова.",
+        reply_markup=game_keyboard(message.from_user.id)
+    )
+
+
+@dp.message(Command("balance"))
+async def balance_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+    u = get_user(message.from_user.id)
+
+    await message.answer(
+        f"💰 Твой баланс: <b>{u[3]}</b>\n"
+        f"⭐ Уровень: <b>{level(message.from_user.id)}</b>\n"
+        f"✨ XP: <b>{u[4]}</b>"
+    )
+
+
+@dp.message(Command("profile"))
+async def profile_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+    await show_profile(message, message.from_user.id)
+
+
+async def show_profile(message, uid):
+    u = get_user(uid)
+    if not u:
+        return
+
+    await message.answer(
+        "👤 <b>ПРОФИЛЬ ИГРОКА</b>\n\n"
+        f"👤 {u[2]}\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"💰 Баланс: <b>{u[3]}</b>\n"
+        f"⭐ Уровень: <b>{level(uid)}</b>\n"
+        f"✨ XP: <b>{u[4]}</b>\n"
+        f"🎰 Круток: <b>{u[5]}</b>\n"
+        f"🏆 Побед: <b>{u[6]}</b>\n"
+        f"💎 Лучший выигрыш: <b>{u[7]}</b>\n"
+        f"🎯 Текущая ставка: <b>{u[8]}</b> 💰",
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "menu")
+async def menu_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    await call.answer()
+    await call.message.edit_text(
+        "🎰 <b>СЛОТЫ</b>\n\nВыбери действие:",
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "game")
+async def game_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    await call.answer()
+    await game_screen(call.message, call.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("bet:"))
+async def bet_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    bet = int(call.data.split(":")[1])
+    update_user(call.from_user.id, "bet", bet)
+
+    await call.answer(f"Ставка: {bet} 💰")
+    await game_screen(call.message, call.from_user.id)
+
+
+async def slot_animation(message, uid):
+    frames = [
+        "🎰 <b>КРУТИМ...</b>\n\n❓ | ❓ | ❓",
+        "🎰 <b>КРУТИМ...</b>\n\n🍒 | ❓ | ❓",
+        "🎰 <b>КРУТИМ...</b>\n\n🍒 | 🔔 | ❓",
+        "🎰 <b>КРУТИМ...</b>\n\n🍒 | 🔔 | 💎"
+    ]
+
+    for frame in frames:
+        try:
+            await message.edit_text(frame)
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.25)
+
+
+def spin_result():
+    return [
+        random.choice(SYMBOLS),
+        random.choice(SYMBOLS),
+        random.choice(SYMBOLS)
+    ]
+
+
+def calculate_win(result, bet):
+    a, b, c = result
+
+    if a == b == c:
+        return bet * MULT[a]
+
+    if a == b or a == c or b == c:
+        return bet * 2
+
+    return 0
+
+
+@dp.callback_query(F.data == "spin")
+async def spin_callback(call: CallbackQuery):
+    uid = call.from_user.id
+    register_user(call.from_user, call.message.chat)
+
+    u = get_user(uid)
+    bet = u[8]
+
+    if u[3] < bet:
+        await call.answer("❌ Недостаточно монет!", show_alert=True)
+        return
+
+    update_user(uid, "balance", u[3] - bet)
+    update_user(uid, "spins", u[5] + 1)
+    add_xp(uid, 10)
+
+    await call.answer()
+    await slot_animation(call.message, uid)
+
+    result = spin_result()
+    win = calculate_win(result, bet)
+
+    u = get_user(uid)
+
+    if win > 0:
+        update_user(uid, "balance", u[3] + win)
+        update_user(uid, "wins", u[6] + 1)
+
+        if win > u[7]:
+            update_user(uid, "best_win", win)
+
+        text = (
+            "🎰 <b>РЕЗУЛЬТАТ</b>\n\n"
+            f"{result[0]} | {result[1]} | {result[2]}\n\n"
+            f"🎉 <b>ВЫИГРЫШ: +{win} 💰</b>\n"
+        )
+
+        if result[0] == result[1] == result[2] == "7️⃣":
+            text += "\n💎💎💎 <b>ДЖЕКПОТ!</b> 💎💎💎"
+
+    else:
+        text = (
+            "🎰 <b>РЕЗУЛЬТАТ</b>\n\n"
+            f"{result[0]} | {result[1]} | {result[2]}\n\n"
+            f"😢 Проигрыш: <b>-{bet} 💰</b>"
+        )
+
+    u = get_user(uid)
+
+    text += (
+        f"\n\n💰 Баланс: <b>{u[3]}</b>"
+        f"\n⭐ Уровень: <b>{level(uid)}</b>"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"🎰 КРУТИТЬ ЕЩЁ • {bet} 💰", callback_data="spin")
+    kb.button(text="🎯 Изменить ставку", callback_data="game")
+    kb.button(text="🔙 Меню", callback_data="menu")
+    kb.adjust(1)
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+    @dp.message(Command("bonus"))
+async def bonus_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    uid = message.from_user.id
+    u = get_user(uid)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if u[9] == today:
+        await message.answer("🎁 Ты уже забрал ежедневный бонус сегодня!")
+        return
+
+    reward = 100 + level(uid) * 25
+
+    update_user(uid, "balance", u[3] + reward)
+    update_user(uid, "bonus_day", today)
+
+    await message.answer(
+        f"🎁 <b>ЕЖЕДНЕВНЫЙ БОНУС</b>\n\n"
+        f"Ты получил <b>+{reward} 💰</b>!"
+    )
+
+
+@dp.callback_query(F.data == "profile")
+async def profile_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+    await call.answer()
+    await show_profile(call.message, call.from_user.id)
+
+
+@dp.callback_query(F.data == "combos")
+async def combos_callback(call: CallbackQuery):
+    await call.answer()
+
+    text = (
+        "🔢 <b>КОМБИНАЦИИ</b>\n\n"
+        "🍒🍒🍒 — x5\n"
+        "🍋🍋🍋 — x7\n"
+        "🍊🍊🍊 — x10\n"
+        "🔔🔔🔔 — x15\n"
+        "💎💎💎 — x30\n"
+        "7️⃣7️⃣7️⃣ — x100 💎\n\n"
+        "Любые 2 одинаковых символа — x2"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад", callback_data="menu")
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "top")
+async def top_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+    await call.answer()
+
+    con = db()
+
+    rows = con.execute(
+        """
+        SELECT name,balance,spins,wins
+        FROM users
+        ORDER BY balance DESC
+        LIMIT 10
+        """
+    ).fetchall()
+
+    con.close()
+
+    text = "🏆 <b>ТОП ЛУДИКОВ ПО МОНЕТАМ</b>\n\n"
+
+    for i, row in enumerate(rows, 1):
+        text += (
+            f"{i}. {row[0]} — "
+            f"<b>{row[1]} 💰</b>\n"
+        )
+
+    if not rows:
+        text += "Пока никого нет."
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💰 По монетам", callback_data="top_money")
+    kb.button(text="🎰 По круткам", callback_data="top_spins")
+    kb.button(text="🏆 По победам", callback_data="top_wins")
+    kb.button(text="💎 Лучшие выигрыши", callback_data="top_best")
+    kb.button(text="🔙 Назад", callback_data="menu")
+    kb.adjust(2, 2, 1)
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+
+
+async def show_top(call, mode):
+    con = db()
+
+    if mode == "money":
+        rows = con.execute(
+            "SELECT name,balance FROM users ORDER BY balance DESC LIMIT 10"
+        ).fetchall()
+        title = "💰 ТОП ПО МОНЕТАМ"
+
+    elif mode == "spins":
+        rows = con.execute(
+            "SELECT name,spins FROM users ORDER BY spins DESC LIMIT 10"
+        ).fetchall()
+        title = "🎰 ТОП ПО КРУТКАМ"
+
+    elif mode == "wins":
+        rows = con.execute(
+            "SELECT name,wins FROM users ORDER BY wins DESC LIMIT 10"
+        ).fetchall()
+        title = "🏆 ТОП ПО ПОБЕДАМ"
+
+    else:
+        rows = con.execute(
+            "SELECT name,best_win FROM users ORDER BY best_win DESC LIMIT 10"
+        ).fetchall()
+        title = "💎 ТОП ЛУЧШИХ ВЫИГРЫШЕЙ"
+
+    con.close()
+
+    text = f"🏆 <b>{title}</b>\n\n"
+
+    for i, row in enumerate(rows, 1):
+        text += f"{i}. {row[0]} — <b>{row[1]}</b>\n"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💰 Монеты", callback_data="top_money")
+    kb.button(text="🎰 Крутки", callback_data="top_spins")
+    kb.button(text="🏆 Победы", callback_data="top_wins")
+    kb.button(text="💎 Лучший выигрыш", callback_data="top_best")
+    kb.button(text="🔙 Назад", callback_data="menu")
+    kb.adjust(2, 2, 1)
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "top_money")
+async def top_money(call: CallbackQuery):
+    await call.answer()
+    await show_top(call, "money")
+
+
+@dp.callback_query(F.data == "top_spins")
+async def top_spins(call: CallbackQuery):
+    await call.answer()
+    await show_top(call, "spins")
+
+
+@dp.callback_query(F.data == "top_wins")
+async def top_wins(call: CallbackQuery):
+    await call.answer()
+    await show_top(call, "wins")
+
+
+@dp.callback_query(F.data == "top_best")
+async def top_best(call: CallbackQuery):
+    await call.answer()
+    await show_top(call, "best")
+
 
 @dp.callback_query(F.data == "achievements")
-async def achievements(c: CallbackQuery):
-    u = get_user(c.from_user.id)
+async def achievements_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
 
-    items = []
+    uid = call.from_user.id
+    u = get_user(uid)
 
-    if u["spins"] >= 10:
-        items.append("🎰 Ветеран — 10 вращений")
+    achievements = []
 
-    if u["spins"] >= 100:
-        items.append("🎰 Мастер — 100 вращений")
+    if u[5] >= 1:
+        achievements.append("🎰 Первая крутка")
 
-    if u["wins"] >= 10:
-        items.append("🏆 Победитель — 10 побед")
+    if u[5] >= 100:
+        achievements.append("🎰 100 круток")
 
-    if u["best_win"] >= 1000:
-        items.append("💎 Большой куш — выигрыш 1000+")
+    if u[6] >= 10:
+        achievements.append("🏆 10 побед")
 
-    if level(u["xp"]) >= 10:
-        items.append("⭐ Опытный игрок — уровень 10")
+    if u[3] >= 10000:
+        achievements.append("💰 10 000 монет")
 
-    if u["dice_wins"] >= 10:
-        items.append("🎲 Кубик — 10 побед")
+    if u[7] >= 1000:
+        achievements.append("💎 Большой выигрыш")
 
-    if u["duel_wins"] >= 10:
-        items.append("⚔️ Дуэлянт — 10 побед")
+    if level(uid) >= 10:
+        achievements.append("⭐ 10 уровень")
 
     text = "🏅 <b>ДОСТИЖЕНИЯ</b>\n\n"
 
-    if items:
-        text += "\n".join("✅ " + x for x in items)
+    if achievements:
+        text += "\n".join(
+            "✅ " + x for x in achievements
+        )
     else:
-        text += "🔒 Пока нет открытых достижений.\n\n"
-        text += "Продолжай играть!"
+        text += "🔒 Пока нет открытых достижений."
 
-    b = InlineKeyboardBuilder()
-    b.button(text="👤 Профиль", callback_data="profile")
-    b.button(text="🏠 Меню", callback_data="menu")
-    b.adjust(1)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Профиль", callback_data="profile")
+    kb.button(text="🔙 Назад", callback_data="menu")
 
-    await c.message.edit_text(
+    await call.message.edit_text(
         text,
-        reply_markup=b.as_markup()
+        reply_markup=kb.as_markup()
     )
-    await c.answer()
+    await call.answer()
 
 
-# =========================
-# STATISTICS
-# =========================
+@dp.callback_query(F.data == "missions")
+async def missions_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
 
-@dp.callback_query(F.data == "statistics")
-async def statistics(c: CallbackQuery):
-    u = get_user(c.from_user.id)
+    uid = call.from_user.id
+    u = get_user(uid)
 
     text = (
-        "📊 <b>СТАТИСТИКА</b>\n\n"
-        "🎰 <b>Слоты</b>\n"
-        f"Игры: {u['spins']}\n"
-        f"Победы: {u['wins']}\n"
-        f"Лучший выигрыш: {u['best_win']}\n\n"
-        "🎲 <b>Кубик</b>\n"
-        f"Игры: {u['dice_games']}\n"
-        f"Победы: {u['dice_wins']}\n\n"
-        "⚔️ <b>Дуэли</b>\n"
-        f"Дуэлей: {u['duel_games']}\n"
-        f"Побед: {u['duel_wins']}"
+        "📋 <b>МИССИИ</b>\n\n"
+        f"🎰 Сделать 10 круток: "
+        f"<b>{min(u[11], 10)}/10</b>\n"
+        f"🏆 Получить 3 победы: "
+        f"<b>{min(u[12], 3)}/3</b>\n\n"
+        "Награда за выполнение:\n"
+        "💰 <b>250 монет</b>"
     )
 
-    b = InlineKeyboardBuilder()
-    b.button(text="👤 Профиль", callback_data="profile")
-    b.button(text="🏠 Меню", callback_data="menu")
-    b.adjust(1)
+    if u[11] >= 10 and u[12] >= 3:
+        text += "\n\n🎉 <b>МИССИИ ВЫПОЛНЕНЫ!</b>"
 
-    await c.message.edit_text(
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад", callback_data="menu")
+
+    await call.message.edit_text(
         text,
-        reply_markup=b.as_markup()
+        reply_markup=kb.as_markup()
     )
-    await c.answer()
+    await call.answer()
 
 
-# =========================
-# MY RATING
-# =========================
+@dp.callback_query(F.data == "wheel")
+async def wheel_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    uid = call.from_user.id
+    u = get_user(uid)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if u[10] == today:
+        await call.answer(
+            "🎡 Ты уже крутил колесо сегодня!",
+            show_alert=True
+        )
+        return
+
+    rewards = [50, 100, 150, 250, 500, 1000]
+    reward = random.choice(rewards)
+
+    update_user(uid, "balance", u[3] + reward)
+    update_user(uid, "wheel_day", today)
+
+    await call.answer()
+
+    await call.message.edit_text(
+        "🎡 <b>КОЛЕСО УДАЧИ</b>\n\n"
+        "🎡 Крутим...\n"
+        "🔄 🔄 🔄"
+    )
+
+    await asyncio.sleep(1)
+
+    await call.message.edit_text(
+        "🎡 <b>КОЛЕСО УДАЧИ</b>\n\n"
+        f"🎉 Тебе выпало <b>+{reward} 💰</b>!"
+    )
+
+
+@dp.callback_query(F.data == "happy")
+async def happy_callback(call: CallbackQuery):
+    await call.answer()
+
+    hour = datetime.now(timezone.utc).hour
+
+    if hour in [18, 19, 20]:
+        text = (
+            "⏰ <b>СЧАСТЛИВЫЙ ЧАС</b>\n\n"
+            "🔥 Сейчас действует счастливый час!\n"
+            "Шанс на хороший результат повышен."
+        )
+    else:
+        text = (
+            "⏰ <b>СЧАСТЛИВЫЙ ЧАС</b>\n\n"
+            "Сейчас счастливый час не активен.\n"
+            "Приходи вечером!"
+        )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад", callback_data="menu")
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "group")
+async def group_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    chat = call.message.chat
+
+    if chat.type == "private":
+        await call.answer(
+            "👥 Этот раздел работает в группе.",
+            show_alert=True
+        )
+        return
+
+    con = db()
+
+    row = con.execute(
+        """
+        SELECT title,spins,coins,wins
+        FROM chats
+        WHERE id=?
+        """,
+        (chat.id,)
+    ).fetchone()
+
+    members = con.execute(
+        "SELECT COUNT(*) FROM chat_users WHERE chat_id=?",
+        (chat.id,)
+    ).fetchone()[0]
+
+    con.close()
+
+    if not row:
+        title = chat.title or "Группа"
+        spins = coins = wins = 0
+    else:
+        title, spins, coins, wins = row
+
+    text = (
+        f"👥 <b>{title}</b>\n\n"
+        f"👤 Игроков: <b>{members}</b>\n"
+        f"🎰 Круток: <b>{spins}</b>\n"
+        f"🏆 Побед: <b>{wins}</b>\n"
+        f"💰 Монет выиграно: <b>{coins}</b>"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏆 Топ группы", callback_data="group_top")
+    kb.button(text="🔙 Назад", callback_data="menu")
+    kb.adjust(1)
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "group_top")
+async def group_top_callback(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    con = db()
+
+    rows = con.execute(
+        """
+        SELECT u.name,u.balance
+        FROM users u
+        JOIN chat_users c ON c.user_id=u.id
+        WHERE c.chat_id=?
+        ORDER BY u.balance DESC
+        LIMIT 10
+        """,
+        (call.message.chat.id,)
+    ).fetchall()
+
+    con.close()
+
+    text = "🏆 <b>ТОП ГРУППЫ</b>\n\n"
+
+    for i, row in enumerate(rows, 1):
+        text += f"{i}. {row[0]} — <b>{row[1]} 💰</b>\n"
+
+    if not rows:
+        text += "Пока игроков нет."
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👥 Статистика", callback_data="group")
+    kb.button(text="🔙 Назад", callback_data="menu")
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "duel")
+async def duel_callback(call: CallbackQuery):
+    await call.answer()
+
+    text = (
+        "🎲 <b>ДУЭЛЬ</b>\n\n"
+        "Сыграй с другим игроком.\n\n"
+        "Для создания дуэли:\n"
+        "<code>/duel 100</code>\n\n"
+        "После этого соперник сможет принять вызов."
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад", callback_data="menu")
+
+    await call.message.edit_text(
+        text,
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.message(Command("duel"))
+async def duel_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    args = message.text.split()
+
+    if len(args) < 2:
+        await message.answer(
+            "🎲 Используй:\n"
+            "<code>/duel 100</code>"
+        )
+        return
+
+    try:
+        bet = int(args[1])
+    except ValueError:
+        await message.answer("❌ Неверная ставка.")
+        return
+
+    if bet <= 0:
+        await message.answer("❌ Ставка должна быть больше нуля.")
+        return
+
+    u = get_user(message.from_user.id)
+
+    if u[3] < bet:
+        await message.answer("❌ Недостаточно монет.")
+        return
+
+    con = db()
+
+    cur = con.execute(
+        """
+        INSERT INTO duels(chat_id,user1,bet,status)
+        VALUES(?,?,?,'waiting')
+        """,
+        (message.chat.id, message.from_user.id, bet)
+    )
+
+    duel_id = cur.lastrowid
+
+    con.commit()
+    con.close()
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="🎲 Принять дуэль",
+        callback_data=f"accept_duel:{duel_id}"
+    )
+
+    await message.answer(
+        f"🎲 <b>НОВАЯ ДУЭЛЬ</b>\n\n"
+        f"Игрок: {message.from_user.full_name}\n"
+        f"Ставка: <b>{bet} 💰</b>\n\n"
+        "Кто рискнёт?",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("accept_duel:"))
+async def accept_duel(call: CallbackQuery):
+    register_user(call.from_user, call.message.chat)
+
+    duel_id = int(call.data.split(":")[1])
+
+    con = db()
+
+    duel = con.execute(
+        """
+        SELECT user1,bet,status
+        FROM duels
+        WHERE id=?
+        """,
+        (duel_id,)
+    ).fetchone()
+
+    if not duel or duel[2] != "waiting":
+        con.close()
+        await call.answer(
+            "❌ Дуэль уже недоступна.",
+            show_alert=True
+        )
+        return
+
+    user1, bet, status = duel
+
+    if user1 == call.from_user.id:
+        con.close()
+        await call.answer(
+            "❌ Нельзя принять свою дуэль.",
+            show_alert=True
+        )
+        return
+
+    u2 = get_user(call.from_user.id)
+
+    if u2[3] < bet:
+        con.close()
+        await call.answer(
+            "❌ У тебя недостаточно монет.",
+            show_alert=True
+        )
+        return
+
+    u1 = get_user(user1)
+
+    if u1[3] < bet:
+        con.close()
+        await call.answer(
+            "❌ У создателя уже недостаточно монет.",
+            show_alert=True
+        )
+        return
+
+    winner = random.choice([user1, call.from_user.id])
+
+    update_user(user1, "balance", u1[3] - bet)
+    update_user(
+        call.from_user.id,
+        "balance",
+        u2[3] - bet
+    )
+
+    prize = bet * 2
+
+    winner_user = get_user(winner)
+    update_user(
+        winner,
+        "balance",
+        winner_user[3] + prize
+    )
+
+    con.execute(
+        "UPDATE duels SET user2=?,status='finished' WHERE id=?",
+        (call.from_user.id, duel_id)
+    )
+
+    con.commit()
+    con.close()
+
+    if winner == user1:
+        winner_name = u1[2]
+    else:
+        winner_name = u2[2]
+
+    await call.answer()
+
+    await call.message.edit_text(
+        "🎲 <b>ДУЭЛЬ ЗАВЕРШЕНА!</b>\n\n"
+        f"🏆 Победитель: <b>{winner_name}</b>\n"
+        f"💰 Приз: <b>{prize} 💰</b>"
+    )
+
+
+@dp.message(Command("pay"))
+async def pay_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    if not message.reply_to_message:
+        await message.answer(
+            "💸 Чтобы перевести монеты, ответь на сообщение игрока:\n\n"
+            "<code>/pay 100</code>"
+        )
+        return
+
+    args = message.text.split()
+
+    if len(args) < 2:
+        await message.answer("❌ Укажи сумму.")
+        return
+
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.answer("❌ Неверная сумма.")
+        return
+
+    if amount <= 0:
+        await message.answer("❌ Сумма должна быть больше нуля.")
+        return
+
+    sender = get_user(message.from_user.id)
+    target_id = message.reply_to_message.from_user.id
+
+    if target_id == message.from_user.id:
+        await message.answer("❌ Нельзя переводить самому себе.")
+        return
+
+    target = get_user(target_id)
+
+    if not target:
+        register_user(
+            message.reply_to_message.from_user,
+            message.chat
+        )
+        target = get_user(target_id)
+
+    if sender[3] < amount:
+        await message.answer("❌ Недостаточно монет.")
+        return
+
+    update_user(
+        message.from_user.id,
+        "balance",
+        sender[3] - amount
+    )
+
+    update_user(
+        target_id,
+        "balance",
+        target[3] + amount
+    )
+
+    await message.answer(
+        f"💸 <b>Перевод выполнен!</b>\n\n"
+        f"👤 Получатель: {target[2]}\n"
+        f"💰 Сумма: <b>{amount}</b>"
+    )
+
+
+@dp.message(Command("group"))
+async def group_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    if message.chat.type == "private":
+        await message.answer(
+            "👥 Команда работает внутри группы."
+        )
+        return
+
+    await group_callback(
+        FakeCallback(message)
+    )
+
+
+class FakeCallback:
+    def __init__(self, message):
+        self.message = message
+        self.from_user = message.from_user
+
+    async def answer(self, *args, **kwargs):
+        pass
+
+
+@dp.callback_query(F.data == "stats")
+async def stats_callback(call: CallbackQuery):
+    uid = call.from_user.id
+    u = get_user(uid)
+
+    await call.answer()
+
+    await call.message.edit_text(
+        "📊 <b>СТАТИСТИКА</b>\n\n"
+        f"🎰 Круток: <b>{u[5]}</b>\n"
+        f"🏆 Побед: <b>{u[6]}</b>\n"
+        f"💎 Лучший выигрыш: <b>{u[7]}</b>\n"
+        f"⭐ Уровень: <b>{level(uid)}</b>\n"
+        f"✨ XP: <b>{u[4]}</b>",
+        reply_markup=main_keyboard()
+    )
+
 
 @dp.callback_query(F.data == "my_rating")
-async def my_rating(c: CallbackQuery):
-    u = get_user(c.from_user.id)
+async def my_rating(call: CallbackQuery):
+    uid = call.from_user.id
 
-    row = db(
+    con = db()
+
+    better = con.execute(
+        "SELECT COUNT(*) FROM users WHERE balance > "
+        "(SELECT balance FROM users WHERE id=?)",
+        (uid,)
+    ).fetchone()[0]
+
+    con.close()
+
+    await call.answer()
+
+    await call.message.edit_text(
+        "🏆 <b>МОЙ РЕЙТИНГ</b>\n\n"
+        f"Твоё место: <b>#{better + 1}</b>",
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "my_clan")
+async def my_clan(call: CallbackQuery):
+    await call.answer()
+
+    con = db()
+
+    row = con.execute(
         """
-        SELECT COUNT(*)+1 place
-       
+        SELECT c.name
+        FROM clans c
+        JOIN clan_users cu ON cu.clan_id=c.id
+        WHERE cu.user_id=?
+        """,
+        (call.from_user.id,)
+    ).fetchone()
+
+    con.close()
+
+    if row:
+        text = f"👥 <b>МОЙ КЛАН</b>\n\n🏰 {row[0]}"
+    else:
+        text = (
+            "👥 <b>МОЙ КЛАН</b>\n\n"
+            "Ты пока не состоишь в клане."
+        )
+
+    await call.message.edit_text(
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+def update_missions(uid, win=False):
+    u = get_user(uid)
+
+    if not u:
+        return
+
+    spins = u[11] + 1
+    wins = u[12] + (1 if win else 0)
+
+    update_user(uid, "mission_spins", spins)
+    update_user(uid, "mission_wins", wins)
+
+
+def update_chat_stats(chat_id, win, win_amount):
+    con = db()
+
+    con.execute(
+        """
+        UPDATE chats
+        SET spins=spins+1,
+            wins=wins+?,
+            coins=coins+?
+        WHERE id=?
+        """,
+        (1 if win else 0, win_amount, chat_id)
+    )
+
+    con.commit()
+    con.close()
+
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    uid = message.from_user.id
+    u = get_user(uid)
+
+    await message.answer(
+        "📊 <b>ТВОЯ СТАТИСТИКА</b>\n\n"
+        f"🎰 Круток: <b>{u[5]}</b>\n"
+        f"🏆 Побед: <b>{u[6]}</b>\n"
+        f"💎 Лучший выигрыш: <b>{u[7]}</b>\n"
+        f"⭐ Уровень: <b>{level(uid)}</b>\n"
+        f"✨ XP: <b>{u[4]}</b>"
+    )
+
+
+@dp.message(Command("rating"))
+async def rating_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    uid = message.from_user.id
+
+    con = db()
+
+    place = con.execute(
+        """
+        SELECT COUNT(*) + 1
+        FROM users
+        WHERE balance >
+        (SELECT balance FROM users WHERE id=?)
+        """,
+        (uid,)
+    ).fetchone()[0]
+
+    con.close()
+
+    await message.answer(
+        f"🏆 Твоё место в рейтинге: <b>#{place}</b>"
+    )
+
+
+@dp.message(Command("wheel"))
+async def wheel_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    fake = FakeCallback(message)
+    await wheel_callback(fake)
+
+
+@dp.message(Command("missions"))
+async def missions_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    fake = FakeCallback(message)
+    await missions_callback(fake)
+
+
+@dp.message(Command("top"))
+async def top_cmd(message: Message):
+    register_user(message.from_user, message.chat)
+
+    fake = FakeCallback(message)
+    await top_callback(fake)
+
+
+@dp.message(Command("group"))
+async def group_command_again(message: Message):
+    register_user(message.from_user, message.chat)
+
+    if message.chat.type == "private":
+        await message.answer(
+            "👥 Эта команда работает в группе."
+        )
+        return
+
+    con = db()
+
+    row = con.execute(
+        """
+        SELECT title,spins,coins,wins
+        FROM chats
+        WHERE id=?
+        """,
+        (message.chat.id,)
+    ).fetchone()
+
+    members = con.execute(
+        "SELECT COUNT(*) FROM chat_users WHERE chat_id=?",
+        (message.chat.id,)
+    ).fetchone()[0]
+
+    con.close()
+
+    title = row[0] if row 
